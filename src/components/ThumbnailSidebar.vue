@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
 import { convertFileSrc } from '@tauri-apps/api/core'
@@ -7,6 +7,7 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { useDirectoryStore } from '@/stores/directory'
 import { useSettingsStore } from '@/stores/settings'
 import { useThumbnailStore } from '@/stores/thumbnail'
+import { calcItemStep, calcStartIndex, ITEM_PAD, ITEM_BORDER, ITEM_MARGIN, ITEM_STEP_EXTRA } from '@/utils/thumbnailLayout'
 
 // ─── i18n ──────────────────────────────────────────────────────────────────
 
@@ -31,24 +32,44 @@ const directoryName = computed(() => {
 /** 当前设置的缩略图最长边，单位 px，96 / 160 / 256。 */
 const thumbSize = computed(() => settings.value.layout.thumbnailSize)
 
-/**
- * 缩略图栏 item 的外框尺寸，略大于缩略图本身（含 padding）。
- * 纵向布局时 item 高度 = thumbSize + 30（文件名行）+ padding
- * 横向布局时 item 宽度 = thumbSize + padding
- */
-const ITEM_PADDING = 20 // 上下 padding 合计
-const ITEM_LABEL_HEIGHT = 28 // 文件名行高度（固定）
+// ─── 尺寸常量从 thumbnailLayout.ts 导入，JS 与 CSS 共享同一套数值 ──────────
+// ITEM_PAD=12, ITEM_BORDER=2, ITEM_MARGIN=4, ITEM_STEP_EXTRA=18
+// calcItemStep(thumbSize) = thumbSize + 18
+// calcStartIndex(scroll, step, buffer, total) → 起始索引
 
-const itemMainSize = computed(() => thumbSize.value + ITEM_PADDING)
-const itemFullHeight = computed(() => thumbSize.value + ITEM_PADDING + ITEM_LABEL_HEIGHT)
+/** 纵向侧栏参数 */
+const SIDEBAR_THUMB_GAP = 8   // thumb 与文件名之间的 gap
+const SIDEBAR_SIDE_PAD = 10   // 容器左右 padding 合计
+const SIDEBAR_BORDER = 1      // 容器右侧 border
+
+/** 纵向侧栏宽度随 thumbSize 自适应（缩略图 + gap + 文件名最小宽度 + 两侧 padding + border）。 */
+const sidebarWidth = computed(() => {
+  // 文件名区域最小 80px，让 256 档也能放下
+  const nameMinWidth = 80
+  return thumbSize.value + ITEM_PAD + SIDEBAR_THUMB_GAP + nameMinWidth + SIDEBAR_SIDE_PAD * 2 + SIDEBAR_BORDER
+})
+
+/** 每个 item 在滚动轴方向上的步进。 */
+const itemStep = computed(() => calcItemStep(thumbSize.value))
 
 // ─── 虚拟滚动 ───────────────────────────────────────────────────────────────
 
 /** 容器 DOM 引用。 */
 const containerRef = ref<HTMLElement | null>(null)
 
+/** 第一个 spacer（spacerBefore）的 DOM 引用，用于测量内容偏移量。 */
+const spacerBeforeRef = ref<HTMLElement | null>(null)
+
 /** 容器可视区域尺寸（宽/高），横向模式用宽，纵向模式用高。 */
 const viewportSize = ref(0)
+
+/**
+ * 内容偏移量：spacer 起始位置在滚动轴方向上距容器滚动原点的距离。
+ * 纵向：padding-top(14) + 标题高度 + 标题 margin-bottom(12)
+ * 横向：padding-left(10)
+ * 通过 spacerBeforeRef.offsetTop / offsetLeft 实测，避免硬编码。
+ */
+const contentOffset = ref(0)
 
 /** 当前滚动位置（scrollTop 或 scrollLeft）。 */
 const scrollPos = ref(0)
@@ -59,27 +80,26 @@ const isHorizontal = computed(() => settings.value.layout.thumbnailPosition === 
 /** 总条目数。 */
 const totalCount = computed(() => directoryStore.entries.length)
 
-/** 每个 item 在滚动轴方向上的尺寸。 */
-const itemSize = computed(() => isHorizontal.value ? itemMainSize.value : itemFullHeight.value)
-
 /** 总内容尺寸（用于撑开滚动容器）。 */
-const totalContentSize = computed(() => totalCount.value * itemSize.value)
+const totalContentSize = computed(() => totalCount.value * itemStep.value)
 
 /** 可视区域能显示的条目数。 */
-const visibleCount = computed(() => Math.ceil(viewportSize.value / itemSize.value))
+const visibleCount = computed(() => Math.ceil(viewportSize.value / itemStep.value))
 
 /** 缓冲区大小（两侧各加 BUFFER_COUNT 个 item）。 */
 const BUFFER_COUNT = 6
 
+/** 已扣除 contentOffset 的有效滚动量（不小于 0）。 */
+const adjustedScroll = computed(() => Math.max(0, scrollPos.value - contentOffset.value))
+
 /** 可视范围起始索引（含 buffer）。 */
-const startIndex = computed(() => {
-  const raw = Math.floor(scrollPos.value / itemSize.value)
-  return Math.max(0, raw - BUFFER_COUNT)
-})
+const startIndex = computed(() =>
+  calcStartIndex(adjustedScroll.value, itemStep.value, BUFFER_COUNT, totalCount.value)
+)
 
 /** 可视范围结束索引（含 buffer，不超过总数）。 */
 const endIndex = computed(() => {
-  const raw = Math.floor(scrollPos.value / itemSize.value) + visibleCount.value
+  const raw = Math.floor(adjustedScroll.value / itemStep.value) + visibleCount.value
   return Math.min(totalCount.value - 1, raw + BUFFER_COUNT)
 })
 
@@ -90,9 +110,9 @@ const visibleEntries = computed(() => {
 })
 
 /** 虚拟滚动：顶部/左侧占位高度/宽度。 */
-const spacerBeforeSize = computed(() => startIndex.value * itemSize.value)
+const spacerBeforeSize = computed(() => startIndex.value * itemStep.value)
 /** 虚拟滚动：底部/右侧占位高度/宽度。 */
-const spacerAfterSize = computed(() => (totalCount.value - endIndex.value - 1) * itemSize.value)
+const spacerAfterSize = computed(() => (totalCount.value - endIndex.value - 1) * itemStep.value)
 
 // ─── 懒加载 ──────────────────────────────────────────────────────────────────
 
@@ -114,16 +134,18 @@ function scrollToCurrentItem(): void {
   const idx = directoryStore.currentIndex
   if (idx < 0) return
 
-  const pos = idx * itemSize.value
-  const size = itemSize.value
+  const step = itemStep.value
+  const offset = contentOffset.value
+  // item 在滚动内容中的实际位置 = contentOffset + idx * step
+  const pos = offset + idx * step
   const viewStart = isHorizontal.value ? container.scrollLeft : container.scrollTop
   const viewEnd = viewStart + viewportSize.value
 
   if (pos < viewStart) {
     if (isHorizontal.value) container.scrollLeft = pos
     else container.scrollTop = pos
-  } else if (pos + size > viewEnd) {
-    const target = pos + size - viewportSize.value
+  } else if (pos + step > viewEnd) {
+    const target = pos + step - viewportSize.value
     if (isHorizontal.value) container.scrollLeft = target
     else container.scrollTop = target
   }
@@ -137,21 +159,26 @@ function handleScroll(): void {
   scrollPos.value = isHorizontal.value ? container.scrollLeft : container.scrollTop
 }
 
-function updateViewportSize(): void {
+function updateViewport(): void {
   const container = containerRef.value
   if (!container) return
   viewportSize.value = isHorizontal.value ? container.clientWidth : container.clientHeight
+  // 测量 spacer 起始位置，得到内容偏移量
+  const spacer = spacerBeforeRef.value
+  if (spacer) {
+    contentOffset.value = isHorizontal.value ? spacer.offsetLeft : spacer.offsetTop
+  }
 }
 
 let resizeObserver: ResizeObserver | null = null
 
 onMounted(() => {
   resizeObserver = new ResizeObserver(() => {
-    updateViewportSize()
+    updateViewport()
     requestVisibleThumbnails()
   })
   if (containerRef.value) resizeObserver.observe(containerRef.value)
-  updateViewportSize()
+  updateViewport()
   requestVisibleThumbnails()
 })
 
@@ -174,10 +201,13 @@ watch(
   },
 )
 
-// 目录 entries 变化时更新可见缩略图
+// 目录 entries 变化时更新可见缩略图，并在 DOM 更新后重测 contentOffset
 watch(
   () => directoryStore.entries,
   () => {
+    nextTick(() => {
+      updateViewport()
+    })
     requestVisibleThumbnails()
   },
 )
@@ -199,6 +229,20 @@ watch(
 watch(thumbSize, () => {
   thumbnailStore.reset()
   requestVisibleThumbnails()
+})
+
+// 布局方向切换时重置滚动位置并重读 viewport
+watch(isHorizontal, () => {
+  scrollPos.value = 0
+  if (containerRef.value) {
+    containerRef.value.scrollLeft = 0
+    containerRef.value.scrollTop = 0
+  }
+  // nextTick 后 viewport 已更新为新方向尺寸
+  requestAnimationFrame(() => {
+    updateViewport()
+    scrollToCurrentItem()
+  })
 })
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────
@@ -238,6 +282,7 @@ function getErrorI18n(path: string): string {
     ref="containerRef"
     class="thumbnail-sidebar"
     :class="{ 'thumbnail-sidebar--horizontal': isHorizontal }"
+    :style="!isHorizontal ? { width: sidebarWidth + 'px', flex: `0 0 ${sidebarWidth}px` } : {}"
     @scroll.passive="handleScroll"
   >
     <!-- 目录标题（纵向模式显示，横向模式空间不足不显示） -->
@@ -259,6 +304,7 @@ function getErrorI18n(path: string): string {
     <template v-else>
       <!-- 上方/左侧占位 -->
       <div
+        ref="spacerBeforeRef"
         class="thumbnail-sidebar__spacer"
         :style="isHorizontal
           ? { width: spacerBeforeSize + 'px', flex: '0 0 auto' }
@@ -274,7 +320,6 @@ function getErrorI18n(path: string): string {
           'thumbnail-sidebar__item--active':
             startIndex + sliceIndex === directoryStore.currentIndex,
         }"
-        :title="entry.name"
         :style="{ '--thumb-size': thumbSize + 'px' }"
         @click="directoryStore.select(startIndex + sliceIndex)"
       >
@@ -297,14 +342,17 @@ function getErrorI18n(path: string): string {
           <div
             v-else
             class="thumbnail-sidebar__error-placeholder"
-            :title="getErrorI18n(entry.path)"
           >
-            <span class="thumbnail-sidebar__error-icon">⚠</span>
+            <span class="thumbnail-sidebar__error-icon" :title="getErrorI18n(entry.path)">⚠</span>
           </div>
         </div>
 
-        <!-- 文件名截断 + tooltip -->
-        <a-tooltip :title="entry.name" placement="right" :mouse-enter-delay="0.5">
+        <!-- 文件名截断 + tooltip（纵向右侧，横向顶部） -->
+        <a-tooltip
+          :title="entry.name"
+          :placement="isHorizontal ? 'top' : 'right'"
+          :mouse-enter-delay="0.5"
+        >
           <span class="thumbnail-sidebar__name">{{ entry.name }}</span>
         </a-tooltip>
       </button>
@@ -325,6 +373,7 @@ function getErrorI18n(path: string): string {
 
 .thumbnail-sidebar {
   display: flex;
+  /* 宽度由 JS 根据 thumbSize 动态绑定（sidebarWidth），此处作为 fallback */
   width: 220px;
   min-height: 0;
   flex: 0 0 220px;
@@ -363,6 +412,19 @@ function getErrorI18n(path: string): string {
 
 /* ─── item ───────────────────────────────────────────────────────────── */
 
+/*
+ * 尺寸常量对应表（与 script 中 ITEM_PAD/ITEM_BORDER/ITEM_MARGIN/ITEM_STEP_EXTRA 一一对应）：
+ *   padding: 6px（上下各 6px）           → ITEM_PAD = 12
+ *   border:  1px（上下/左右各 1px）      → ITEM_BORDER = 2
+ *   纵向 margin-bottom: 4px              → ITEM_MARGIN = 4
+ *   横向 margin-right: 4px + gap 2px = 6px  ≈ ITEM_MARGIN = 4（gap 通过 flex gap 补齐，见下）
+ *
+ *   纵向 itemStep = thumbSize + 12 + 2 + 4 = thumbSize + 18
+ *   横向 itemStep = (thumbSize + 12) + (border 2) + (margin-right 4) = thumbSize + 18
+ *
+ * 注意：item 高度/宽度由内容撑开（thumb 固定 thumbSize × thumbSize + padding），
+ *       JS 直接把 itemStep 作为步进，不依赖浏览器测量。
+ */
 .thumbnail-sidebar__item {
   display: flex;
   flex-shrink: 0;
@@ -375,21 +437,23 @@ function getErrorI18n(path: string): string {
   color: inherit;
   cursor: pointer;
   text-align: left;
+  /* 去掉 outline，选中态用 border 体现 */
+  outline: none;
 }
 
-/* 纵向布局：垂直排列，宽度撑满，高度由 --thumb-size 决定 */
+/* 纵向布局：垂直排列，宽度撑满，高度由 thumbSize 决定（含 padding/border = thumbSize+14） */
 .thumbnail-sidebar:not(.thumbnail-sidebar--horizontal) .thumbnail-sidebar__item {
   width: 100%;
   flex-direction: row;
-  margin-bottom: 4px;
+  margin-bottom: 4px;   /* ITEM_MARGIN = 4，纵向步进的一部分 */
 }
 
-/* 横向布局：水平排列，宽由 --thumb-size 决定 */
+/* 横向布局：水平排列，宽由 thumbSize 决定 */
 .thumbnail-sidebar--horizontal .thumbnail-sidebar__item {
   flex-direction: column;
+  /* 宽度 = thumbSize + padding 6×2 = thumbSize + 12（ITEM_PAD）*/
   width: calc(var(--thumb-size, 96px) + 12px);
-  min-height: calc(var(--thumb-size, 96px) + 28px + 12px);
-  margin-right: 6px;
+  margin-right: 4px;    /* ITEM_MARGIN = 4，横向步进的一部分 */
 }
 
 .thumbnail-sidebar__item:hover,
@@ -460,6 +524,7 @@ function getErrorI18n(path: string): string {
 
 .thumbnail-sidebar__error-icon {
   font-size: 20px;
+  cursor: default;
 }
 
 /* ─── 文件名 ─────────────────────────────────────────────────────────── */

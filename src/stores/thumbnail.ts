@@ -1,4 +1,4 @@
-import { shallowRef } from 'vue'
+import { markRaw, shallowRef, triggerRef } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 
@@ -19,14 +19,26 @@ interface CacheEntry {
 }
 
 export const useThumbnailStore = defineStore('thumbnail', () => {
-  /** path → CacheEntry，用 shallowRef 避免深响应开销。 */
-  const cache = shallowRef(new Map<string, CacheEntry>())
+  /**
+   * path → CacheEntry，用 shallowRef 避免深响应开销。
+   * Map 本身原地修改，写入后调用 triggerRef 通知 Vue（M5：避免全量复制）。
+   */
+  const cache = shallowRef(markRaw(new Map<string, CacheEntry>()))
+
   /** 正在发起中的 invoke 数量（用于并发控制）。 */
   const activeRequests = shallowRef(0)
+
   /** pending 队列：等待并发位的 path 列表。 */
   const pendingQueue: string[] = []
+
   /** 已发起 invoke 但尚未完成的 path 集合（避免重复 invoke）。 */
   const inflightPaths = new Set<string>()
+
+  /**
+   * M4：epoch 计数器。reset()/evict() 时自增，doLoad 回写前核验。
+   * 不匹配说明 size 切换或目录切换导致此次结果已过期，直接丢弃。
+   */
+  let epoch = 0
 
   /**
    * 获取缩略图状态（纯同步，用于模板绑定）。
@@ -47,37 +59,46 @@ export const useThumbnailStore = defineStore('thumbnail', () => {
     // 已有结果则跳过
     const existing = cache.value.get(path)
     if (existing && existing.state.status !== 'idle') return
-    // 已在 in-flight 则跳过
+    // 已在 in-flight 则跳过（M4：去重）
     if (inflightPaths.has(path)) return
 
     // 标记 loading 并触发（或加入队列）
     setEntry(path, { status: 'loading' }, false)
 
     if (activeRequests.value < maxConcurrency) {
-      void doLoad(path, size, maxConcurrency)
+      void doLoad(path, size, maxConcurrency, epoch)
     } else {
       pendingQueue.push(path)
     }
   }
 
   /** 实际执行 invoke，完成后消费 pending 队列。 */
-  async function doLoad(path: string, size: number, maxConcurrency: number): Promise<void> {
+  async function doLoad(path: string, size: number, maxConcurrency: number, startEpoch: number): Promise<void> {
     activeRequests.value += 1
     inflightPaths.add(path)
     try {
+      // M4：发起前再次核验 epoch，若已被 reset/evict 则直接退出
+      if (startEpoch !== epoch) return
+
       const ext = path.split('.').pop()?.toLowerCase() ?? ''
       if (ext === 'svg') {
         // SVG 直接展示原文件
         const src = convertFileSrc(path)
-        setEntry(path, { status: 'loaded', src }, false)
+        if (startEpoch === epoch) setEntry(path, { status: 'loaded', src }, false)
         return
       }
 
       // 调用后端生成/命中缓存，返回磁盘文件绝对路径
       const cachePath = await invoke<string>('get_thumbnail', { path, size })
+
+      // M4：回写前校验 epoch，防止尺寸切换/目录切换的竞态
+      if (startEpoch !== epoch) return
+
       const src = convertFileSrc(cachePath)
       setEntry(path, { status: 'loaded', src }, false)
     } catch (err) {
+      // M4：回写前校验 epoch
+      if (startEpoch !== epoch) return
       // 解析结构化错误
       const code = extractErrorCode(err)
       setEntry(path, { status: 'error', code }, false)
@@ -98,24 +119,26 @@ export const useThumbnailStore = defineStore('thumbnail', () => {
       const entry = cache.value.get(next)
       if (!entry || entry.state.status !== 'loading') continue
       if (inflightPaths.has(next)) continue
-      void doLoad(next, size, maxConcurrency)
+      void doLoad(next, size, maxConcurrency, epoch)
     }
   }
 
   /**
    * 淘汰不再需要的缩略图缓存（切换目录时调用）。
    * keepPaths 之外的 loaded 条目会被清除，objectURL 会被 revoke。
+   * M4：自增 epoch，清空 inflightPaths 以使进行中的请求回写时自动丢弃。
    */
   function evict(keepPaths: Set<string>): void {
-    const next = new Map<string, CacheEntry>()
-    for (const [path, entry] of cache.value) {
-      if (keepPaths.has(path)) {
-        next.set(path, entry)
-      } else {
-        // 若是 objectURL 则释放（本项目当前都是 convertFileSrc，非 objectURL）
+    epoch += 1
+    inflightPaths.clear()
+
+    const map = cache.value
+    for (const [path, entry] of map) {
+      if (!keepPaths.has(path)) {
         if (entry.isObjectUrl && entry.state.status === 'loaded') {
           URL.revokeObjectURL(entry.state.src)
         }
+        map.delete(path)
       }
     }
     // 清空 pending queue 中不在 keepPaths 的项目
@@ -125,25 +148,33 @@ export const useThumbnailStore = defineStore('thumbnail', () => {
         pendingQueue.splice(i, 1)
       }
     }
-    cache.value = next
+    triggerRef(cache)
   }
 
-  /** 清空所有缓存（强制重置，例如设置 size 变更后需重新生成）。 */
+  /** 清空所有缓存（强制重置，例如设置 size 变更后需重新生成）。
+   * M4：自增 epoch，清空 inflightPaths。
+   */
   function reset(): void {
+    epoch += 1
+    inflightPaths.clear()
+
     for (const [, entry] of cache.value) {
       if (entry.isObjectUrl && entry.state.status === 'loaded') {
         URL.revokeObjectURL(entry.state.src)
       }
     }
     pendingQueue.length = 0
-    cache.value = new Map()
+    cache.value.clear()
+    triggerRef(cache)
   }
 
-  /** 更新 Map 中某个 path 的状态，触发响应式更新。 */
+  /**
+   * 更新 Map 中某个 path 的状态，触发响应式更新。
+   * M5：原地 set + triggerRef，避免全量 Map 复制（O(n²) → O(1)）。
+   */
   function setEntry(path: string, state: ThumbnailStatus, isObjectUrl: boolean): void {
-    const next = new Map(cache.value)
-    next.set(path, { state, isObjectUrl })
-    cache.value = next
+    cache.value.set(path, { state, isObjectUrl })
+    triggerRef(cache)
   }
 
   return { cache, getState, request, evict, reset }

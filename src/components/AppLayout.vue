@@ -54,24 +54,42 @@ watch(directoryError, (error) => {
   if (error) void message.error(t('directory.openFailed'))
 })
 
-// ─── M3：当前图加载完成后预加载前后 N 张原图 ──────────────────────────────
+// ─── 预加载去重缓存：模块级 Map，容量 2N+1，随 currentIndex 滑动清理 ──────
+
+/** path → HTMLImageElement，保持引用避免 GC 清除预加载资源。 */
+const preloadCache = new Map<string, HTMLImageElement>()
+
+// ─── M3：切换到新图后预加载前后 N 张原图 ───────────────────────────────────
 
 watch(
-  () => imageStore.loading,
-  (loading) => {
-    if (loading) return
-    // 图片加载完成，预热前后 N 张
+  () => currentEntry.value?.path,
+  () => {
+    // 改为监听 currentEntry.path，切换图片时立即预加载，无需等待 loading 翻转
     const count = settings.value.performance.preloadNormalCount
     if (count <= 0) return
     const entries = directoryStore.entries
     const idx = directoryStore.currentIndex
+
+    // 本次需要的路径集合
+    const needed = new Set<string>()
     for (let i = 1; i <= count; i++) {
       for (const offset of [-i, i]) {
         const target = entries[idx + offset]
-        if (target) {
-          const img = new Image()
-          img.src = convertFileSrc(target.path)
-        }
+        if (target) needed.add(target.path)
+      }
+    }
+
+    // 淘汰不再需要的缓存条目（滑动窗口）
+    for (const [path] of preloadCache) {
+      if (!needed.has(path)) preloadCache.delete(path)
+    }
+
+    // 对新增路径创建 Image 对象并缓存（避免重复创建）
+    for (const path of needed) {
+      if (!preloadCache.has(path)) {
+        const img = new Image()
+        img.src = convertFileSrc(path)
+        preloadCache.set(path, img)
       }
     }
   },
@@ -79,8 +97,8 @@ watch(
 
 // ─── 方向键 auto-repeat 节流 ───────────────────────────────────────────────
 
-/** 上次通过 repeat 事件切图的时间戳。 */
-let lastRepeatTime = 0
+/** 上次通过 repeat 事件切图的时间戳（按键独立，互不影响）。 */
+const lastRepeatTime: Record<string, number> = {}
 const REPEAT_THROTTLE_MS = 80
 
 async function toggleFullscreen(force?: boolean) {
@@ -108,14 +126,16 @@ function handleKeydown(event: KeyboardEvent) {
   }
   if (command || event.altKey) return
 
-  // 方向键 auto-repeat 节流
-  if (event.repeat && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+  // 方向键 auto-repeat 节流（各键独立时间戳，互不干扰）
+  if (event.repeat && (event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+    || event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
     const now = Date.now()
-    if (now - lastRepeatTime < REPEAT_THROTTLE_MS) {
+    const last = lastRepeatTime[event.key] ?? 0
+    if (now - last < REPEAT_THROTTLE_MS) {
       event.preventDefault()
       return
     }
-    lastRepeatTime = now
+    lastRepeatTime[event.key] = now
   }
 
   const actions: Record<string, () => void> = {

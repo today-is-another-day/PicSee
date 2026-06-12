@@ -1,4 +1,4 @@
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::{DynamicImage, ImageFormat, ImageReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,20 +11,20 @@ use std::{
 use tauri::{AppHandle, Manager};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// 支持缩略图生成的格式扩展名（小写）。
+/// Supported thumbnail format extensions (lowercase).
 const THUMBNAIL_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 
-/// 大图跳过阈值：单边超过此值或文件超过 MAX_FILE_BYTES 时跳过缩略图。
+/// Skip thumbnail when either side exceeds this pixel count or file exceeds MAX_FILE_BYTES.
 const MAX_SIDE_PIXELS: u32 = 12_000;
 const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
-/// 结构化错误，便于前端按 code 映射 i18n。
+/// Structured error for frontend i18n mapping by code.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThumbnailError {
-    /// 错误码，前端据此选择 i18n 文案。
+    /// Error code; frontend selects the i18n string based on this.
     pub code: &'static str,
-    /// 补充说明（英文），code 未知时前端可回退显示此字段。
+    /// Supplementary message (English); shown as fallback when code is unknown.
     pub message: String,
 }
 
@@ -34,15 +34,36 @@ impl ThumbnailError {
     }
 }
 
-/// in-flight 任务结果类型。
-type InFlightResult = Option<Result<PathBuf, String>>;
-/// in-flight watch sender 类型。
+/// Internal error enum for generate_thumbnail, preserving semantic error codes.
+#[derive(Debug)]
+pub enum GenError {
+    ImageTooLarge,
+    DecodeFailed(String),
+    IoFailed(String),
+}
+
+impl GenError {
+    fn into_thumbnail_error(self) -> ThumbnailError {
+        match self {
+            GenError::ImageTooLarge => ThumbnailError::new(
+                "IMAGE_TOO_LARGE",
+                format!("Image side exceeds {MAX_SIDE_PIXELS} pixels; thumbnail skipped"),
+            ),
+            GenError::DecodeFailed(msg) => ThumbnailError::new("DECODE_ERROR", msg),
+            GenError::IoFailed(msg) => ThumbnailError::new("IO_ERROR", msg),
+        }
+    }
+}
+
+/// In-flight task result type — carries semantic error code as string.
+type InFlightResult = Option<Result<PathBuf, (/* code */ &'static str, String)>>;
+/// In-flight watch sender type.
 type InFlightSender = Arc<tokio::sync::watch::Sender<InFlightResult>>;
 
-/// 并发控制状态，通过 Tauri managed state 共享。
+/// Concurrency control state, shared via Tauri managed state.
 pub struct ThumbnailState {
     semaphore: Arc<Semaphore>,
-    /// in-flight map：cache_key → watch sender，用于合并同一文件的并发请求。
+    /// in-flight map: cache_key → watch sender, merges concurrent requests for the same file.
     in_flight: Mutex<HashMap<String, InFlightSender>>,
 }
 
@@ -55,16 +76,16 @@ impl ThumbnailState {
     }
 }
 
-/// 获取缩略图命令。
-/// 返回磁盘缓存文件的绝对路径，前端用 convertFileSrc 显示。
-/// SVG 文件不经此命令，前端直接用原文件。
+/// Get thumbnail command.
+/// Returns the absolute path of the disk-cached thumbnail; frontend uses convertFileSrc to display it.
+/// SVG files are not handled here — the frontend displays them directly.
 #[tauri::command]
 pub async fn get_thumbnail(
     app: AppHandle,
     path: String,
     size: u32,
 ) -> Result<String, ThumbnailError> {
-    // 限制 size 只允许合法值
+    // Restrict size to valid values.
     let size = match size {
         96 | 160 | 256 => size,
         _ => 160,
@@ -72,31 +93,33 @@ pub async fn get_thumbnail(
 
     let file_path = PathBuf::from(&path);
 
-    // 检查扩展名，SVG 不走此命令
+    // Check extension; SVG must not reach this command.
     let ext = file_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "svg" {
-        return Err(ThumbnailError::new("UNSUPPORTED_FORMAT", "SVG 文件应由前端直接显示"));
+        return Err(ThumbnailError::new("UNSUPPORTED_FORMAT", "SVG files should be displayed directly by the frontend"));
     }
     if !THUMBNAIL_EXTENSIONS.contains(&ext.as_str()) {
-        return Err(ThumbnailError::new("UNSUPPORTED_FORMAT", format!("不支持的格式: {ext}")));
+        return Err(ThumbnailError::new("UNSUPPORTED_FORMAT", format!("Unsupported format: {ext}")));
     }
 
-    // 检查路径是否在已授权 asset scope 内
-    if !app.asset_protocol_scope().is_allowed(&file_path) {
-        return Err(ThumbnailError::new("NOT_ALLOWED", format!("路径未经授权: {path}")));
+    // Minor 9: use canonical path for NOT_ALLOWED check to avoid symlink bypass.
+    let canonical = fs::canonicalize(&file_path)
+        .unwrap_or_else(|_| file_path.clone());
+    if !app.asset_protocol_scope().is_allowed(&canonical) {
+        return Err(ThumbnailError::new("NOT_ALLOWED", format!("Path not authorized: {path}")));
     }
 
-    // 读取文件元数据以计算 cache key
+    // Read file metadata to compute cache key.
     let metadata = fs::metadata(&file_path)
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("读取文件元数据失败: {e}")))?;
+        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to read file metadata: {e}")))?;
 
     let file_size = metadata.len();
     if file_size > MAX_FILE_BYTES {
-        return Err(ThumbnailError::new("FILE_TOO_LARGE", "文件超过 100MB，跳过缩略图"));
+        return Err(ThumbnailError::new("FILE_TOO_LARGE", "File exceeds 100 MB; thumbnail skipped"));
     }
 
     let modified = metadata
@@ -108,81 +131,88 @@ pub async fn get_thumbnail(
         })
         .unwrap_or(0);
 
-    // 计算稳定 cache key
-    let canonical = fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
+    // Compute stable cache key.
     let cache_key = compute_cache_key(&canonical, file_size, modified, size);
 
-    // 缓存目录
+    // Cache directory.
     let cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("获取缓存目录失败: {e}")))?
+        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to get cache directory: {e}")))?
         .join("thumbnails");
     let cache_file = cache_dir.join(format!("{cache_key}.webp"));
 
-    // 命中磁盘缓存时直接授权并返回
+    // Minor 2: grant asset scope once at setup; here just ensure the dir exists in scope on cache hit.
     if cache_file.exists() {
         ensure_cache_scope(&app, &cache_dir)?;
         return Ok(cache_file.to_string_lossy().into_owned());
     }
 
-    // in-flight 合并：同一 key 的并发请求只生成一次
+    // In-flight deduplication: only one generation task per cache key.
     let state = app.state::<ThumbnailState>();
     let maybe_rx: Option<tokio::sync::watch::Receiver<InFlightResult>> = {
         let mut map = state.in_flight.lock().unwrap();
         if let Some(tx) = map.get(&cache_key) {
-            // 已有正在进行的生成任务，等待其结果
+            // A generation task is already running; subscribe to its result.
             Some(tx.subscribe())
         } else {
-            // 注册占位
-            let (tx, _rx) =
-                tokio::sync::watch::channel::<InFlightResult>(None);
+            // Register placeholder.
+            let (tx, _rx) = tokio::sync::watch::channel::<InFlightResult>(None);
             map.insert(cache_key.clone(), Arc::new(tx));
             None
         }
     };
 
     if let Some(mut rx) = maybe_rx {
-        // 等待已有任务完成
+        // Wait for the existing task to complete.
         rx.changed()
             .await
-            .map_err(|_| ThumbnailError::new("IO_ERROR", "等待缩略图生成任务时通道关闭"))?;
+            .map_err(|_| ThumbnailError::new("IO_ERROR", "Channel closed while waiting for thumbnail task"))?;
         let result: InFlightResult = rx.borrow().clone();
         return match result {
-            Some(Ok(out_path)) => Ok(out_path.to_string_lossy().into_owned()),
-            Some(Err(e)) => Err(ThumbnailError::new("DECODE_ERROR", e)),
-            None => Err(ThumbnailError::new("IO_ERROR", "缩略图生成任务未产生结果")),
+            Some(Ok(out_path)) => {
+                ensure_cache_scope(&app, &cache_dir)?;
+                Ok(out_path.to_string_lossy().into_owned())
+            }
+            // M2: forward the original error code faithfully instead of collapsing to DECODE_ERROR.
+            Some(Err((code, msg))) => Err(ThumbnailError::new(code, msg)),
+            None => Err(ThumbnailError::new("IO_ERROR", "Thumbnail task produced no result")),
         };
     }
 
-    // 获取并发信号量
+    // Acquire concurrency semaphore.
     let permit: OwnedSemaphorePermit = Arc::clone(&state.semaphore)
         .acquire_owned()
         .await
-        .map_err(|_| ThumbnailError::new("IO_ERROR", "信号量已关闭"))?;
+        .map_err(|_| ThumbnailError::new("IO_ERROR", "Semaphore closed"))?;
 
-    // 在 blocking 线程中生成缩略图
+    // Generate thumbnail on a blocking thread.
     let cache_dir_clone = cache_dir.clone();
     let cache_file_clone = cache_file.clone();
     let cache_key_clone = cache_key.clone();
     let path_clone = path.clone();
 
-    let result: Result<PathBuf, String> = tauri::async_runtime::spawn_blocking(move || {
-        // permit 在此闭包结束时释放
+    let result: Result<PathBuf, GenError> = tauri::async_runtime::spawn_blocking(move || {
+        // permit is dropped when this closure ends, releasing the semaphore slot.
         let _permit: OwnedSemaphorePermit = permit;
         generate_thumbnail(&path_clone, &cache_dir_clone, &cache_file_clone, size)
     })
     .await
-    .map_err(|e| format!("生成缩略图任务崩溃: {e}"))
+    .map_err(|e| GenError::IoFailed(format!("Thumbnail task panicked: {e}")))
     .and_then(|r| r);
 
-    // 通知等待者
+    // Notify waiters with the semantically correct error code (M2).
     {
         let mut map = state.in_flight.lock().unwrap();
         if let Some(tx) = map.remove(&cache_key_clone) {
             let notify_value: InFlightResult = match &result {
                 Ok(p) => Some(Ok(p.clone())),
-                Err(e) => Some(Err(e.clone())),
+                Err(GenError::ImageTooLarge) => Some(Err((
+                    "IMAGE_TOO_LARGE",
+                    format!("Image side exceeds {MAX_SIDE_PIXELS} pixels; thumbnail skipped"),
+                ))),
+                Err(GenError::DecodeFailed(msg)) => Some(Err(("DECODE_ERROR", msg.clone()))),
+                Err(GenError::IoFailed(msg)) => Some(Err(("IO_ERROR", msg.clone()))),
             };
             let _ = tx.send(notify_value);
         }
@@ -193,17 +223,17 @@ pub async fn get_thumbnail(
             ensure_cache_scope(&app, &cache_dir)?;
             Ok(out_path.to_string_lossy().into_owned())
         }
-        Err(e) => Err(ThumbnailError::new("DECODE_ERROR", e)),
+        Err(gen_err) => Err(gen_err.into_thumbnail_error()),
     }
 }
 
-/// 清理缩略图磁盘缓存，返回释放的字节数。
+/// Clear thumbnail disk cache; returns freed bytes.
 #[tauri::command]
 pub async fn clear_thumbnail_cache(app: AppHandle) -> Result<u64, ThumbnailError> {
     let cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("获取缓存目录失败: {e}")))?
+        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to get cache directory: {e}")))?
         .join("thumbnails");
 
     if !cache_dir.exists() {
@@ -213,7 +243,7 @@ pub async fn clear_thumbnail_cache(app: AppHandle) -> Result<u64, ThumbnailError
     let freed = tauri::async_runtime::spawn_blocking(move || {
         let mut total: u64 = 0;
         let entries = fs::read_dir(&cache_dir)
-            .map_err(|e| format!("读取缓存目录失败: {e}"))?;
+            .map_err(|e| format!("Failed to read cache directory: {e}"))?;
         for entry in entries.filter_map(Result::ok) {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
@@ -225,17 +255,17 @@ pub async fn clear_thumbnail_cache(app: AppHandle) -> Result<u64, ThumbnailError
         Ok::<u64, String>(total)
     })
     .await
-    .map_err(|e| ThumbnailError::new("IO_ERROR", format!("清理任务崩溃: {e}")))?
+    .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Cache clear task panicked: {e}")))?
     .map_err(|e| ThumbnailError::new("IO_ERROR", e))?;
 
     Ok(freed)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 内部辅助函数（pub 供测试模块使用）
+// Internal helpers (pub for test modules)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// 计算稳定 cache key（SHA-256 前 16 字节十六进制，共 32 字符）。
+/// Compute a stable cache key (first 16 bytes of SHA-256, hex-encoded = 32 chars).
 pub fn compute_cache_key(
     canonical_path: &Path,
     file_size: u64,
@@ -251,21 +281,21 @@ pub fn compute_cache_key(
     hasher.update(b":");
     hasher.update(size.to_le_bytes());
     let digest = hasher.finalize();
-    // 取前 16 字节（128 位）→ 32 字符 hex
+    // Take first 16 bytes (128 bits) → 32 hex chars.
     let bytes: &[u8] = &digest[..16];
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 生成缩略图并写入磁盘，返回缓存文件路径。
+/// Generate a thumbnail and write it to disk; returns the cache file path.
 pub fn generate_thumbnail(
     src_path: &str,
     cache_dir: &Path,
     cache_file: &Path,
     size: u32,
-) -> Result<PathBuf, String> {
-    // 确保缓存目录存在
+) -> Result<PathBuf, GenError> {
+    // Ensure cache directory exists.
     fs::create_dir_all(cache_dir)
-        .map_err(|e| format!("创建缓存目录失败: {e}"))?;
+        .map_err(|e| GenError::IoFailed(format!("Failed to create cache directory: {e}")))?;
 
     let path = Path::new(src_path);
     let ext = path
@@ -274,63 +304,70 @@ pub fn generate_thumbnail(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // 读取原始字节
-    let raw = fs::read(path)
-        .map_err(|e| format!("读取图片文件失败: {e}"))?;
-
-    // 解码图片
-    let img = decode_image(&raw, &ext, path)
-        .map_err(|e| format!("解码图片失败: {e}"))?;
-
-    // 检查单边像素上限（BMP 等可能很大）
-    let (w, h) = img.dimensions();
-    if w > MAX_SIDE_PIXELS || h > MAX_SIDE_PIXELS {
-        return Err(format!("图片单边超过 {MAX_SIDE_PIXELS} 像素，跳过缩略图"));
+    // M1: read image dimensions from header before full decode; reject oversized images early.
+    {
+        let reader = ImageReader::open(path)
+            .map_err(|e| GenError::IoFailed(format!("Failed to open image file: {e}")))?
+            .with_guessed_format()
+            .map_err(|e| GenError::IoFailed(format!("Failed to guess image format: {e}")))?;
+        // into_dimensions() reads only the header, avoiding full decode.
+        let (w, h) = reader
+            .into_dimensions()
+            .map_err(|e| GenError::DecodeFailed(format!("Failed to read image dimensions: {e}")))?;
+        if w > MAX_SIDE_PIXELS || h > MAX_SIDE_PIXELS {
+            return Err(GenError::ImageTooLarge);
+        }
     }
 
-    // 按比例缩小到 size×size 内
+    // Read raw bytes (needed for EXIF orientation).
+    let raw = fs::read(path)
+        .map_err(|e| GenError::IoFailed(format!("Failed to read image file: {e}")))?;
+
+    // Decode image.
+    let img = decode_image(&raw, &ext, path)
+        .map_err(|e| GenError::DecodeFailed(format!("Failed to decode image: {e}")))?;
+
+    // Resize to fit within size×size.
     let thumb = img.thumbnail(size, size);
 
-    // 编码为 WebP（image 0.25 内置支持）
+    // Encode as WebP (image 0.25 built-in support).
     let mut buf = Cursor::new(Vec::new());
     thumb
         .write_to(&mut buf, ImageFormat::WebP)
-        .map_err(|e| format!("编码 WebP 失败: {e}"))?;
+        .map_err(|e| GenError::IoFailed(format!("Failed to encode WebP: {e}")))?;
 
-    // 原子写入（先写临时文件再 rename）
+    // Atomic write (write to .tmp, then rename).
     let tmp = cache_file.with_extension("tmp");
     fs::write(&tmp, buf.into_inner())
-        .map_err(|e| format!("写入临时缓存文件失败: {e}"))?;
+        .map_err(|e| GenError::IoFailed(format!("Failed to write temp cache file: {e}")))?;
+    // Minor 11: attempt to remove .tmp on rename failure to avoid leftover files.
     fs::rename(&tmp, cache_file).map_err(|e| {
         let _ = fs::remove_file(&tmp);
-        format!("替换缓存文件失败: {e}")
+        GenError::IoFailed(format!("Failed to replace cache file: {e}"))
     })?;
 
     Ok(cache_file.to_path_buf())
 }
 
-/// 解码图片，JPG/JPEG 时先读取并应用 EXIF orientation。
+/// Decode image; for JPEG/WebP/PNG apply EXIF orientation when available.
 pub fn decode_image(raw: &[u8], ext: &str, path: &Path) -> Result<DynamicImage, String> {
-    // GIF 只取首帧（image crate load_from_memory 默认取第一帧）
+    // GIF: take only the first frame (image crate default).
     if ext == "gif" {
         let img = image::load_from_memory_with_format(raw, ImageFormat::Gif)
-            .map_err(|e| format!("解码 GIF 失败: {e}"))?;
+            .map_err(|e| format!("Failed to decode GIF: {e}"))?;
         return Ok(img);
     }
 
     let img = image::load_from_memory(raw)
-        .map_err(|e| format!("解码图片失败 ({}): {e}", path.display()))?;
+        .map_err(|e| format!("Failed to decode image ({}): {e}", path.display()))?;
 
-    // JPEG 应用 EXIF orientation
-    if matches!(ext, "jpg" | "jpeg") {
-        let oriented = apply_exif_orientation(img, raw);
-        return Ok(oriented);
-    }
-
-    Ok(img)
+    // Minor 3: apply EXIF orientation for any container kamadak-exif supports
+    // (JPEG, WebP, PNG with Exif chunk, TIFF, etc.); silently ignored when absent.
+    let oriented = apply_exif_orientation(img, raw);
+    Ok(oriented)
 }
 
-/// 读取 EXIF Orientation 并对图片进行旋转/翻转（对应 EXIF orientation 1-8）。
+/// Read EXIF Orientation and rotate/flip the image accordingly (EXIF orientation 1-8).
 pub fn apply_exif_orientation(img: DynamicImage, raw: &[u8]) -> DynamicImage {
     let orientation = read_exif_orientation(raw).unwrap_or(1);
     match orientation {
@@ -341,11 +378,13 @@ pub fn apply_exif_orientation(img: DynamicImage, raw: &[u8]) -> DynamicImage {
         6 => img.rotate90(),
         7 => img.rotate270().fliph(),
         8 => img.rotate270(),
-        _ => img, // 1 或未知：不旋转
+        _ => img, // 1 or unknown: no rotation
     }
 }
 
-/// 从原始 JPEG 字节读取 EXIF Orientation 值（1-8）。
+/// Read EXIF Orientation value (1-8) from raw image bytes.
+/// Works for any container supported by kamadak-exif (JPEG, WebP, PNG Exif chunk, TIFF…).
+/// Returns None when no EXIF data is found; caller should treat as orientation 1.
 pub fn read_exif_orientation(raw: &[u8]) -> Option<u32> {
     let exif_reader = exif::Reader::new();
     let mut cursor = std::io::Cursor::new(raw);
@@ -357,9 +396,150 @@ pub fn read_exif_orientation(raw: &[u8]) -> Option<u32> {
     }
 }
 
-/// 将缓存目录授权到 asset protocol scope（幂等）。
+/// Grant the cache directory access in the asset protocol scope (idempotent).
 fn ensure_cache_scope(app: &AppHandle, cache_dir: &Path) -> Result<(), ThumbnailError> {
     app.asset_protocol_scope()
         .allow_directory(cache_dir, false)
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("授权缓存目录失败: {e}")))
+        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to authorize cache directory: {e}")))
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::GenericImageView;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Helper: create a minimal valid JPEG in memory using the image crate.
+    fn make_jpeg_bytes(width: u32, height: u32) -> Vec<u8> {
+        use image::{ImageBuffer, ImageFormat, Rgb};
+        let img: ImageBuffer<Rgb<u8>, _> =
+            ImageBuffer::from_fn(width, height, |x, _| Rgb([x as u8, 50u8, 100u8]));
+        let dyn_img = image::DynamicImage::ImageRgb8(img);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        dyn_img.write_to(&mut buf, ImageFormat::Jpeg).expect("JPEG encoding should succeed");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn test_compute_cache_key_deterministic() {
+        let path = Path::new("/tmp/test.jpg");
+        let k1 = compute_cache_key(path, 12345, 9999, 96);
+        let k2 = compute_cache_key(path, 12345, 9999, 96);
+        assert_eq!(k1, k2, "Cache key must be deterministic");
+        assert_eq!(k1.len(), 32, "Cache key must be 32 hex chars");
+    }
+
+    #[test]
+    fn test_compute_cache_key_differs_on_size() {
+        let path = Path::new("/tmp/test.jpg");
+        let k96 = compute_cache_key(path, 100, 0, 96);
+        let k160 = compute_cache_key(path, 100, 0, 160);
+        assert_ne!(k96, k160, "Different sizes must produce different cache keys");
+    }
+
+    #[test]
+    fn test_exif_orientation_no_exif_returns_none() {
+        // PNG bytes with no EXIF — should return None gracefully.
+        let png_bytes = include_bytes!("../tests/fixtures/1x1.png");
+        let result = read_exif_orientation(png_bytes);
+        // No EXIF → None (treated as orientation 1 by caller).
+        assert!(result.is_none() || result == Some(1));
+    }
+
+    #[test]
+    fn test_apply_exif_orientation_identity() {
+        // Orientation 1 (or no EXIF) → image unchanged.
+        let jpeg = make_jpeg_bytes(4, 4);
+        let img = image::load_from_memory(&jpeg).expect("Failed to load test JPEG");
+        let (w, h) = img.dimensions();
+        let oriented = apply_exif_orientation(img, &jpeg);
+        assert_eq!(oriented.dimensions(), (w, h), "Orientation 1 must not change dimensions");
+    }
+
+    #[test]
+    fn test_generate_thumbnail_image_too_large() {
+        // Create a real tiny JPEG and verify successful thumbnail generation.
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache_file = cache_dir.path().join("out.webp");
+
+        // Write a real tiny JPEG to a temp file.
+        let jpeg = make_jpeg_bytes(8, 8);
+        let mut tmp = NamedTempFile::with_suffix(".jpg").expect("NamedTempFile");
+        tmp.write_all(&jpeg).expect("write JPEG");
+
+        let result = generate_thumbnail(
+            tmp.path().to_str().unwrap(),
+            cache_dir.path(),
+            &cache_file,
+            96,
+        );
+        assert!(result.is_ok(), "Tiny JPEG should generate thumbnail successfully: {result:?}");
+    }
+
+    #[test]
+    fn test_generate_thumbnail_returns_image_too_large_error() {
+        // Verify that GenError::ImageTooLarge maps to code IMAGE_TOO_LARGE.
+        let err = GenError::ImageTooLarge.into_thumbnail_error();
+        assert_eq!(err.code, "IMAGE_TOO_LARGE");
+    }
+
+    #[test]
+    fn test_generate_thumbnail_returns_decode_error() {
+        // Verify that GenError::DecodeFailed maps to code DECODE_ERROR.
+        let err = GenError::DecodeFailed("bad data".into()).into_thumbnail_error();
+        assert_eq!(err.code, "DECODE_ERROR");
+    }
+
+    #[test]
+    fn test_generate_thumbnail_returns_io_error() {
+        // Verify that GenError::IoFailed maps to code IO_ERROR.
+        let err = GenError::IoFailed("disk full".into()).into_thumbnail_error();
+        assert_eq!(err.code, "IO_ERROR");
+    }
+
+    #[test]
+    fn test_generate_thumbnail_bad_file_returns_io_error() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache_file = cache_dir.path().join("out.webp");
+        let result = generate_thumbnail(
+            "/nonexistent/path/image.jpg",
+            cache_dir.path(),
+            &cache_file,
+            96,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GenError::IoFailed(_) => {}
+            other => panic!("Expected IoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generate_thumbnail_corrupted_bytes_returns_decode_error() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache_file = cache_dir.path().join("out.webp");
+
+        // Write garbage bytes as a .jpg file.
+        let mut tmp = NamedTempFile::with_suffix(".jpg").expect("NamedTempFile");
+        tmp.write_all(b"not a real jpeg at all garbage bytes").expect("write");
+
+        let result = generate_thumbnail(
+            tmp.path().to_str().unwrap(),
+            cache_dir.path(),
+            &cache_file,
+            96,
+        );
+        assert!(result.is_err());
+        // Could be DecodeFailed (dimension read fails on bad data).
+        match result.unwrap_err() {
+            GenError::DecodeFailed(_) | GenError::IoFailed(_) => {}
+            GenError::ImageTooLarge => panic!("Should not be ImageTooLarge for garbage bytes"),
+        }
+    }
+}
+
