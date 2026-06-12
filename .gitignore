@@ -148,3 +148,6 @@ vite.config.ts.timestamp-*
 # Tauri / Rust
 src-tauri/target
 src-tauri/gen/schemas
+
+# Claude session artifacts
+.claude/
