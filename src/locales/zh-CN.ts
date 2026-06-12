@@ -13,6 +13,15 @@ export default {
   },
   status: { fileName: '文件名', index: '序号', resolution: '分辨率', zoom: '缩放比', fileSize: '文件大小' },
   directory: { openFailed: '打开或扫描图片目录失败' },
+  thumbnail: {
+    error: '缩略图生成失败',
+    errorFileTooLarge: '文件超过 100MB，跳过缩略图',
+    errorImageTooLarge: '图片尺寸过大，跳过缩略图',
+    errorUnsupportedFormat: '不支持此格式的缩略图',
+    errorDecode: '图片解码失败',
+    errorNotAllowed: '路径未经授权',
+    errorIo: '读写缩略图时出错',
+  },
   settings: {
     title: '设置',
     saved: '设置已保存',
@@ -48,6 +57,7 @@ export default {
     preloadLargePreviewCount: '大图 Preview 预加载数量',
     showThumbnailBar: '显示缩略图栏',
     thumbnailPosition: '缩略图栏位置',
+    thumbnailSize: '缩略图尺寸',
     showStatusBar: '显示状态栏',
     compactMode: '紧凑模式',
   },
@@ -55,5 +65,6 @@ export default {
     system: '跟随系统', light: '浅色', dark: '深色', zhCN: '简体中文', enUS: 'English',
     fitWindow: '适应窗口', fitWidth: '适应宽度', actualSize: '原始大小', remember: '记住上次缩放',
     left: '左侧', bottom: '底部',
+    thumbnail96: '小（96px）', thumbnail160: '中（160px）', thumbnail256: '大（256px）',
   },
 }

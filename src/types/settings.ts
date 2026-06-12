@@ -2,8 +2,9 @@ export type AppLanguage = 'system' | 'zh-CN' | 'en-US'
 export type AppTheme = 'system' | 'light' | 'dark'
 export type ZoomMode = 'fit-window' | 'fit-width' | 'actual-size' | 'remember'
 export type ThumbnailPosition = 'left' | 'bottom'
+export type ThumbnailSize = 96 | 160 | 256
 
-/** 与需求 v0.2 §27 严格对应的应用设置结构。 */
+/** 与需求 v0.3 严格对应的应用设置结构。 */
 export interface AppSettings {
   language: AppLanguage
   theme: AppTheme
@@ -39,6 +40,8 @@ export interface AppSettings {
   layout: {
     showThumbnailBar: boolean
     thumbnailPosition: ThumbnailPosition
+    /** 缩略图尺寸（最长边像素），影响缩略图栏 item 显示大小。 */
+    thumbnailSize: ThumbnailSize
     showStatusBar: boolean
     compactMode: boolean
   }

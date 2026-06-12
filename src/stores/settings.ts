@@ -39,6 +39,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   layout: {
     showThumbnailBar: true,
     thumbnailPosition: 'bottom',
+    thumbnailSize: 160,
     showStatusBar: true,
     compactMode: false,
   },

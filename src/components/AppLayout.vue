@@ -15,6 +15,7 @@ import { useDirectoryStore } from '@/stores/directory'
 import { useImageStore } from '@/stores/image'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
+import { convertFileSrc } from '@tauri-apps/api/core'
 
 const appStore = useAppStore()
 const { t } = useI18n()
@@ -53,6 +54,35 @@ watch(directoryError, (error) => {
   if (error) void message.error(t('directory.openFailed'))
 })
 
+// ─── M3：当前图加载完成后预加载前后 N 张原图 ──────────────────────────────
+
+watch(
+  () => imageStore.loading,
+  (loading) => {
+    if (loading) return
+    // 图片加载完成，预热前后 N 张
+    const count = settings.value.performance.preloadNormalCount
+    if (count <= 0) return
+    const entries = directoryStore.entries
+    const idx = directoryStore.currentIndex
+    for (let i = 1; i <= count; i++) {
+      for (const offset of [-i, i]) {
+        const target = entries[idx + offset]
+        if (target) {
+          const img = new Image()
+          img.src = convertFileSrc(target.path)
+        }
+      }
+    }
+  },
+)
+
+// ─── 方向键 auto-repeat 节流 ───────────────────────────────────────────────
+
+/** 上次通过 repeat 事件切图的时间戳。 */
+let lastRepeatTime = 0
+const REPEAT_THROTTLE_MS = 80
+
 async function toggleFullscreen(force?: boolean) {
   const next = force ?? !viewerStore.isFullscreen
   try {
@@ -77,6 +107,17 @@ function handleKeydown(event: KeyboardEvent) {
     return
   }
   if (command || event.altKey) return
+
+  // 方向键 auto-repeat 节流
+  if (event.repeat && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+    const now = Date.now()
+    if (now - lastRepeatTime < REPEAT_THROTTLE_MS) {
+      event.preventDefault()
+      return
+    }
+    lastRepeatTime = now
+  }
+
   const actions: Record<string, () => void> = {
     ArrowLeft: directoryStore.selectPrevious,
     ArrowRight: directoryStore.selectNext,

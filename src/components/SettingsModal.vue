@@ -41,6 +41,11 @@ const thumbnailPositionOptions = computed(() => [
   { value: 'left', label: t('option.left') },
   { value: 'bottom', label: t('option.bottom') },
 ])
+const thumbnailSizeOptions = computed(() => [
+  { value: 96, label: t('option.thumbnail96') },
+  { value: 160, label: t('option.thumbnail160') },
+  { value: 256, label: t('option.thumbnail256') },
+])
 
 async function handleSave() {
   try {
@@ -118,6 +123,9 @@ function handleCancel() {
         <a-form layout="vertical">
           <a-form-item :label="t('settings.thumbnailPosition')">
             <a-select v-model:value="draft.layout.thumbnailPosition" :options="thumbnailPositionOptions" />
+          </a-form-item>
+          <a-form-item :label="t('settings.thumbnailSize')">
+            <a-select v-model:value="draft.layout.thumbnailSize" :options="thumbnailSizeOptions" />
           </a-form-item>
           <a-form-item :label="t('settings.showThumbnailBar')"><a-switch v-model:checked="draft.layout.showThumbnailBar" /></a-form-item>
         </a-form>

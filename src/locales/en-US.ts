@@ -13,6 +13,15 @@ export default {
   },
   status: { fileName: 'File', index: 'Index', resolution: 'Resolution', zoom: 'Zoom', fileSize: 'File size' },
   directory: { openFailed: 'Could not open or scan the image folder' },
+  thumbnail: {
+    error: 'Thumbnail generation failed',
+    errorFileTooLarge: 'File exceeds 100 MB — thumbnail skipped',
+    errorImageTooLarge: 'Image dimensions too large — thumbnail skipped',
+    errorUnsupportedFormat: 'Thumbnails are not supported for this format',
+    errorDecode: 'Image decoding failed',
+    errorNotAllowed: 'Path is not authorized',
+    errorIo: 'An I/O error occurred while reading or writing the thumbnail',
+  },
   settings: {
     title: 'Settings',
     saved: 'Settings saved',
@@ -48,6 +57,7 @@ export default {
     preloadLargePreviewCount: 'Large preview preload count',
     showThumbnailBar: 'Show thumbnail bar',
     thumbnailPosition: 'Thumbnail bar position',
+    thumbnailSize: 'Thumbnail size',
     showStatusBar: 'Show status bar',
     compactMode: 'Compact mode',
   },
@@ -55,5 +65,6 @@ export default {
     system: 'Follow system', light: 'Light', dark: 'Dark', zhCN: '简体中文', enUS: 'English',
     fitWindow: 'Fit window', fitWidth: 'Fit width', actualSize: 'Actual size', remember: 'Remember last zoom',
     left: 'Left', bottom: 'Bottom',
+    thumbnail96: 'Small (96px)', thumbnail160: 'Medium (160px)', thumbnail256: 'Large (256px)',
   },
 }

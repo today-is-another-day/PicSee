@@ -64,6 +64,15 @@ pub enum ThumbnailPosition {
     Bottom,
 }
 
+/// 缩略图尺寸（最长边像素）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u32)]
+pub enum ThumbnailSize {
+    Size96 = 96,
+    Size160 = 160,
+    Size256 = 256,
+}
+
 /// 大图预览最大边长。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u32)]
@@ -159,6 +168,8 @@ pub struct LayoutSettings {
     pub show_thumbnail_bar: bool,
     /// 缩略图栏位置。
     pub thumbnail_position: ThumbnailPosition,
+    /// 缩略图尺寸（最长边像素）。
+    pub thumbnail_size: ThumbnailSize,
     /// 是否显示状态栏。
     pub show_status_bar: bool,
     /// 是否启用紧凑模式。
@@ -233,6 +244,7 @@ impl Default for LayoutSettings {
         Self {
             show_thumbnail_bar: true,
             thumbnail_position: ThumbnailPosition::Bottom,
+            thumbnail_size: ThumbnailSize::Size160,
             show_status_bar: true,
             compact_mode: false,
         }
