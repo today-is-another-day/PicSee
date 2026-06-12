@@ -72,20 +72,20 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   /** 保存当前设置；浏览器开发环境仅保留内存中的值。 */
-  async function saveSettings(nextSettings?: AppSettings) {
-    if (nextSettings) settings.value = cloneSettings(nextSettings)
-    if (!isTauriRuntime()) return
+  async function saveSettings(nextSettings: AppSettings) {
+    const candidate = cloneSettings(nextSettings)
+    if (!isTauriRuntime()) {
+      settings.value = candidate
+      return
+    }
     saving.value = true
     try {
-      await invoke('save_settings', { settings: settings.value })
+      await invoke('save_settings', { settings: candidate })
+      settings.value = candidate
     } finally {
       saving.value = false
     }
   }
 
-  function resetSettings() {
-    settings.value = cloneSettings(DEFAULT_SETTINGS)
-  }
-
-  return { settings, loading, saving, persistenceAvailable, loadSettings, saveSettings, resetSettings }
+  return { settings, loading, saving, persistenceAvailable, loadSettings, saveSettings }
 })

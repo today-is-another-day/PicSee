@@ -15,7 +15,7 @@ export default {
     title: '设置',
     saved: '设置已保存',
     saveFailed: '设置保存失败，已保留当前值',
-    resetDone: '已恢复默认值',
+    resetDone: '已重置，保存后生效',
     group: { general: '通用', appearance: '外观', viewer: '查看', largeImage: '大图', thumbnail: '缩略图', cache: '缓存', performance: '性能', shortcuts: '快捷键', language: '语言', about: '关于' },
     generalDescription: 'PicSee 基础行为与布局选项。',
     shortcutsDescription: '快捷键自定义将在后续里程碑提供。',

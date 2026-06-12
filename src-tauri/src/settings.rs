@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 /// 应用设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
     /// 界面语言。
     pub language: Language,
@@ -84,7 +84,7 @@ pub enum TileSize {
 
 /// 查看器设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct ViewerSettings {
     /// 默认缩放模式。
     pub default_zoom_mode: DefaultZoomMode,
@@ -100,7 +100,7 @@ pub struct ViewerSettings {
 
 /// 大图处理设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct LargeImageSettings {
     /// 判定为大图的文件大小阈值，单位 MB。
     #[serde(rename = "fileSizeThresholdMB")]
@@ -121,7 +121,7 @@ pub struct LargeImageSettings {
 
 /// 缓存设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct CacheSettings {
     /// 内存缓存上限，单位 MB。
     #[serde(rename = "memoryCacheLimitMB")]
@@ -137,7 +137,7 @@ pub struct CacheSettings {
 
 /// 性能设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct PerformanceSettings {
     /// 瓦片处理并发数。
     pub tile_concurrency: u32,
@@ -153,7 +153,7 @@ pub struct PerformanceSettings {
 
 /// 布局设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct LayoutSettings {
     /// 是否显示缩略图栏。
     pub show_thumbnail_bar: bool,
@@ -247,11 +247,28 @@ pub fn read_settings_file(path: &Path) -> Result<AppSettings, String> {
 
     let content = fs::read_to_string(path)
         .map_err(|error| format!("读取设置文件 {} 失败: {error}", path.display()))?;
-    serde_json::from_str(&content)
-        .map_err(|error| format!("解析设置文件 {} 失败: {error}", path.display()))
+    match serde_json::from_str(&content) {
+        Ok(settings) => Ok(settings),
+        Err(_) => {
+            let backup_path = backup_path(path);
+            if backup_path.exists() {
+                fs::remove_file(&backup_path).map_err(|error| {
+                    format!("删除旧设置备份 {} 失败: {error}", backup_path.display())
+                })?;
+            }
+            fs::rename(path, &backup_path).map_err(|error| {
+                format!(
+                    "备份损坏设置文件 {} 到 {} 失败: {error}",
+                    path.display(),
+                    backup_path.display()
+                )
+            })?;
+            Ok(AppSettings::default())
+        }
+    }
 }
 
-/// 将设置写入指定路径，并按需创建父目录。
+/// 将设置写入同目录临时文件后原子替换目标文件。
 pub fn write_settings_file(path: &Path, settings: &AppSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -260,8 +277,35 @@ pub fn write_settings_file(path: &Path, settings: &AppSettings) -> Result<(), St
 
     let content = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("序列化设置失败: {error}"))?;
-    fs::write(path, content)
-        .map_err(|error| format!("写入设置文件 {} 失败: {error}", path.display()))
+    let temporary_path = temporary_path(path);
+    fs::write(&temporary_path, content).map_err(|error| {
+        format!(
+            "写入临时设置文件 {} 失败: {error}",
+            temporary_path.display()
+        )
+    })?;
+    fs::rename(&temporary_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary_path);
+        format!(
+            "用临时设置文件 {} 替换 {} 失败: {error}",
+            temporary_path.display(),
+            path.display()
+        )
+    })
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.bak",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
 }
 
 /// 获取应用配置目录中的设置文件路径。

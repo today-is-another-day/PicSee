@@ -49,11 +49,46 @@ fn settings_reject_unsupported_limited_numeric_values() {
 }
 
 #[test]
+fn settings_with_missing_fields_use_defaults() {
+    let settings: AppSettings = serde_json::from_str(
+        r#"{
+            "language": "en-US",
+            "viewer": {
+                "zoomStep": 0.25
+            }
+        }"#,
+    )
+    .expect("缺少新增字段的旧设置应可解析");
+
+    assert_eq!(settings.language, Language::EnUs);
+    assert_eq!(settings.theme, Theme::System);
+    assert_eq!(settings.viewer.zoom_step, 0.25);
+    assert!(settings.viewer.smooth_zoom);
+    assert_eq!(settings.large_image, AppSettings::default().large_image);
+}
+
+#[test]
+fn corrupt_settings_file_is_backed_up_and_defaults_are_returned() {
+    let temp_dir = test_directory("corrupt-settings");
+    let path = temp_dir.join("settings.json");
+    let backup_path = temp_dir.join("settings.json.bak");
+    std::fs::create_dir_all(&temp_dir).expect("应创建测试目录");
+    std::fs::write(&path, "{ invalid json").expect("应写入损坏设置");
+
+    let loaded = picsee_lib::settings::read_settings_file(&path).expect("损坏设置应回退默认值");
+
+    assert_eq!(loaded, AppSettings::default());
+    assert!(!path.exists());
+    assert_eq!(
+        std::fs::read_to_string(backup_path).expect("损坏设置应备份"),
+        "{ invalid json"
+    );
+    std::fs::remove_dir_all(temp_dir).expect("应清理测试目录");
+}
+
+#[test]
 fn settings_file_round_trip_preserves_values() {
-    let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-data")
-        .join(format!("picsee-settings-test-{}", std::process::id()));
+    let temp_dir = test_directory("round-trip");
     let path = temp_dir.join("settings.json");
     let mut settings = AppSettings::default();
     settings.viewer.zoom_step = 0.25;
@@ -64,4 +99,11 @@ fn settings_file_round_trip_preserves_values() {
 
     assert_eq!(loaded, settings);
     std::fs::remove_dir_all(temp_dir).expect("应清理测试目录");
+}
+
+fn test_directory(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-data")
+        .join(format!("picsee-settings-{name}-{}", std::process::id()))
 }

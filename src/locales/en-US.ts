@@ -15,7 +15,7 @@ export default {
     title: 'Settings',
     saved: 'Settings saved',
     saveFailed: 'Could not save settings; current values were kept',
-    resetDone: 'Defaults restored',
+    resetDone: 'Reset complete. Save to apply.',
     group: { general: 'General', appearance: 'Appearance', viewer: 'Viewer', largeImage: 'Large Images', thumbnail: 'Thumbnails', cache: 'Cache', performance: 'Performance', shortcuts: 'Shortcuts', language: 'Language', about: 'About' },
     generalDescription: 'Basic PicSee behavior and layout options.',
     shortcutsDescription: 'Shortcut customization will be available in a later milestone.',
