@@ -14,6 +14,7 @@ export default {
   settings: {
     title: '设置',
     saved: '设置已保存',
+    loadFailed: '设置加载失败，已使用默认设置',
     saveFailed: '设置保存失败，已保留当前值',
     resetDone: '已重置，保存后生效',
     group: { general: '通用', appearance: '外观', viewer: '查看', largeImage: '大图', thumbnail: '缩略图', cache: '缓存', performance: '性能', shortcuts: '快捷键', language: '语言', about: '关于' },

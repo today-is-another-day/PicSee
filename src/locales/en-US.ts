@@ -14,6 +14,7 @@ export default {
   settings: {
     title: 'Settings',
     saved: 'Settings saved',
+    loadFailed: 'Could not load settings; defaults are being used',
     saveFailed: 'Could not save settings; current values were kept',
     resetDone: 'Reset complete. Save to apply.',
     group: { general: 'General', appearance: 'Appearance', viewer: 'Viewer', largeImage: 'Large Images', thumbnail: 'Thumbnails', cache: 'Cache', performance: 'Performance', shortcuts: 'Shortcuts', language: 'Language', about: 'About' },

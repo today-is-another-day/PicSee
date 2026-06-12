@@ -14,11 +14,13 @@
       {
         "title": "PicSee",
         "width": 1200,
-        "height": 800
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {

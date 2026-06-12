@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, shallowRef } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -56,15 +56,18 @@ export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<AppSettings>(cloneSettings(DEFAULT_SETTINGS))
   const loading = ref(false)
   const saving = ref(false)
+  const loadError = shallowRef<unknown | null>(null)
   const persistenceAvailable = computed(isTauriRuntime)
 
   /** 从 Tauri 读取设置；浏览器开发环境直接使用默认值。 */
   async function loadSettings() {
     if (!isTauriRuntime()) return
     loading.value = true
+    loadError.value = null
     try {
       settings.value = await invoke<AppSettings>('get_settings')
     } catch (error) {
+      loadError.value = error
       console.warn('Unable to load settings, using defaults.', error)
     } finally {
       loading.value = false
@@ -87,5 +90,5 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  return { settings, loading, saving, persistenceAvailable, loadSettings, saveSettings }
+  return { settings, loading, saving, loadError, persistenceAvailable, loadSettings, saveSettings }
 })

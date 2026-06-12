@@ -65,10 +65,11 @@ function handleCancel() {
 
 <template>
   <a-modal
-    v-model:open="appStore.settingsVisible"
+    :open="appStore.settingsVisible"
     :title="t('settings.title')"
     :width="760"
     centered
+    @cancel="handleCancel"
   >
     <a-tabs class="settings-tabs" tab-position="left">
       <a-tab-pane key="general" :tab="t('settings.group.general')">
