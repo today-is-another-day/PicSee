@@ -8,7 +8,10 @@ use std::{
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
-const IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "svg"];
+const IMAGE_EXTENSIONS: [&str; 20] = [
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "svg", "tiff", "tif", "heic", "heif", "dng", "cr2",
+    "cr3", "nef", "arw", "raf", "orf", "rw2", "pef",
+];
 
 /// 图片文件信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -182,6 +185,48 @@ fn allow_directory(app: &AppHandle, directory: &Path) -> Result<(), String> {
     app.asset_protocol_scope()
         .allow_directory(directory, false)
         .map_err(|error| format!("授权图片目录 {} 失败: {error}", directory.display()))
+}
+
+/// 处理 argv、Apple Event 或拖放提供的外部路径。
+#[tauri::command]
+pub async fn open_external_path(app: AppHandle, path: String) -> Result<DirectoryScan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path)
+            .canonicalize()
+            .map_err(|error| format!("无法读取打开路径: {error}"))?;
+        if path.is_dir() {
+            allow_directory(&app, &path)?;
+            return scan_directory_entries(&path);
+        }
+        if !is_supported_image(&path) {
+            return Err(format!("不支持的图片格式: {}", path.display()));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("无法确定图片父目录: {}", path.display()))?;
+        allow_directory(&app, parent)?;
+        let entry = image_entry(&path)?;
+        Ok(DirectoryScan {
+            directory: parent.to_string_lossy().into_owned(),
+            entries: vec![entry],
+        })
+    })
+    .await
+    .map_err(|error| format!("打开外部路径任务失败: {error}"))?
+}
+
+/// 从启动参数中提取存在的图片或目录路径。
+pub fn extract_open_paths<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .skip(1)
+        .map(|arg| PathBuf::from(arg.as_ref()))
+        .filter(|path| path.exists() && (path.is_dir() || is_supported_image(path)))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn image_entry(path: &Path) -> Result<ImageEntry, String> {

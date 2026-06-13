@@ -1,5 +1,6 @@
 use picsee_lib::settings::{
-    AppSettings, DefaultZoomMode, Language, PreviewMaxSize, Theme, ThumbnailPosition, TileSize,
+    AppSettings, DefaultZoomMode, Language, NavigatorMode, NavigatorSize, PreviewMaxSize, Theme,
+    ThumbnailPosition, TileSize,
 };
 
 #[test]
@@ -12,6 +13,9 @@ fn default_settings_match_expected_baseline() {
         settings.viewer.default_zoom_mode,
         DefaultZoomMode::FitWindow
     );
+    assert_eq!(settings.viewer.navigator_mode, NavigatorMode::Auto);
+    assert_eq!(settings.viewer.navigator_size, NavigatorSize::Size200);
+    assert!(!settings.viewer.confirm_delete);
     assert_eq!(
         settings.large_image.preview_max_size,
         PreviewMaxSize::Size4096

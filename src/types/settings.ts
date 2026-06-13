@@ -3,6 +3,8 @@ export type AppTheme = 'system' | 'light' | 'dark'
 export type ZoomMode = 'fit-window' | 'fit-width' | 'actual-size' | 'remember'
 export type ThumbnailPosition = 'left' | 'bottom'
 export type ThumbnailSize = 96 | 160 | 256
+export type NavigatorMode = 'always' | 'auto' | 'hidden'
+export type NavigatorSize = 160 | 200 | 240
 
 /** 与需求 v0.3 严格对应的应用设置结构。 */
 export interface AppSettings {
@@ -14,6 +16,9 @@ export interface AppSettings {
     smoothZoom: boolean
     zoomToCursor: boolean
     resetZoomOnSwitch: boolean
+    navigatorMode: NavigatorMode
+    navigatorSize: NavigatorSize
+    confirmDelete: boolean
   }
   largeImage: {
     fileSizeThresholdMB: number

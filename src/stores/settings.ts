@@ -13,6 +13,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
     smoothZoom: true,
     zoomToCursor: true,
     resetZoomOnSwitch: true,
+    navigatorMode: 'auto',
+    navigatorSize: 200,
+    confirmDelete: false,
   },
   largeImage: {
     fileSizeThresholdMB: 300,

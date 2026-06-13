@@ -15,9 +15,14 @@ export const useViewerStore = defineStore('viewer', () => {
   const isDragging = shallowRef(false)
   const viewport = reactive({ width: 0, height: 0 })
   const image = reactive({ width: 0, height: 0 })
+  const rotation = shallowRef<0 | 90 | 180 | 270>(0)
+  const displayImage = computed(() => rotation.value % 180 === 0
+    ? { width: image.width, height: image.height }
+    : { width: image.height, height: image.width })
   const preservedCenter = shallowRef<{ x: number; y: number } | null>(null)
   const canPan = computed(() =>
-    image.width * zoom.value > viewport.width || image.height * zoom.value > viewport.height,
+    displayImage.value.width * zoom.value > viewport.width
+    || displayImage.value.height * zoom.value > viewport.height,
   )
 
   function setViewport(width: number, height: number) {
@@ -27,11 +32,12 @@ export const useViewerStore = defineStore('viewer', () => {
   }
 
   function setImageSize(width: number, height: number) {
+    if (!width || !height) rotation.value = 0
     image.width = width
     image.height = height
     if (width && height && preservedCenter.value) {
-      offset.x = viewport.width / 2 - preservedCenter.value.x * width * zoom.value
-      offset.y = viewport.height / 2 - preservedCenter.value.y * height * zoom.value
+      offset.x = viewport.width / 2 - preservedCenter.value.x * displayImage.value.width * zoom.value
+      offset.y = viewport.height / 2 - preservedCenter.value.y * displayImage.value.height * zoom.value
       preservedCenter.value = null
       clampOffset()
     }
@@ -46,8 +52,8 @@ export const useViewerStore = defineStore('viewer', () => {
     const nextZoom = mode === 'actual-size'
       ? 1
       : mode === 'fit-width'
-        ? availableWidth / image.width
-        : Math.min(availableWidth / image.width, availableHeight / image.height)
+        ? availableWidth / displayImage.value.width
+        : Math.min(availableWidth / displayImage.value.width, availableHeight / displayImage.value.height)
     zoom.value = clampZoom(nextZoom)
     centerImage()
   }
@@ -60,10 +66,10 @@ export const useViewerStore = defineStore('viewer', () => {
   }
 
   function centerImage() {
-    offset.x = (viewport.width - image.width * zoom.value) / 2
+    offset.x = (viewport.width - displayImage.value.width * zoom.value) / 2
     offset.y = displayMode.value === 'fit-width'
-      ? Math.max(0, (viewport.height - image.height * zoom.value) / 2)
-      : (viewport.height - image.height * zoom.value) / 2
+      ? Math.max(0, (viewport.height - displayImage.value.height * zoom.value) / 2)
+      : (viewport.height - displayImage.value.height * zoom.value) / 2
   }
 
   function setZoom(nextZoom: number, point?: { x: number; y: number }) {
@@ -97,8 +103,8 @@ export const useViewerStore = defineStore('viewer', () => {
   function preserveView() {
     if (image.width && image.height && zoom.value) {
       preservedCenter.value = {
-        x: clampUnit((viewport.width / 2 - offset.x) / (image.width * zoom.value)),
-        y: clampUnit((viewport.height / 2 - offset.y) / (image.height * zoom.value)),
+        x: clampUnit((viewport.width / 2 - offset.x) / (displayImage.value.width * zoom.value)),
+        y: clampUnit((viewport.height / 2 - offset.y) / (displayImage.value.height * zoom.value)),
       }
     }
     displayMode.value = 'custom'
@@ -106,8 +112,21 @@ export const useViewerStore = defineStore('viewer', () => {
 
   function clampOffset() {
     if (!image.width || !image.height || !viewport.width || !viewport.height) return
-    offset.x = clampAxis(offset.x, image.width * zoom.value, viewport.width)
-    offset.y = clampAxis(offset.y, image.height * zoom.value, viewport.height)
+    offset.x = clampAxis(offset.x, displayImage.value.width * zoom.value, viewport.width)
+    offset.y = clampAxis(offset.y, displayImage.value.height * zoom.value, viewport.height)
+  }
+
+  function rotate(clockwise = true) {
+    rotation.value = ((rotation.value + (clockwise ? 90 : 270)) % 360) as 0 | 90 | 180 | 270
+    if (displayMode.value === 'custom') clampOffset()
+    else applyDisplayMode(displayMode.value)
+  }
+
+  function setNormalizedCenter(x: number, y: number) {
+    offset.x = viewport.width / 2 - clampUnit(x) * displayImage.value.width * zoom.value
+    offset.y = viewport.height / 2 - clampUnit(y) * displayImage.value.height * zoom.value
+    displayMode.value = 'custom'
+    clampOffset()
   }
 
   function setDragging(value: boolean) {
@@ -126,6 +145,8 @@ export const useViewerStore = defineStore('viewer', () => {
     isDragging,
     viewport,
     image,
+    rotation,
+    displayImage,
     canPan,
     setViewport,
     setImageSize,
@@ -138,6 +159,8 @@ export const useViewerStore = defineStore('viewer', () => {
     preserveView,
     setDragging,
     setFullscreen,
+    rotate,
+    setNormalizedCenter,
   }
 })
 

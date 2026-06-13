@@ -46,6 +46,12 @@ const thumbnailSizeOptions = computed(() => [
   { value: 160, label: t('option.thumbnail160') },
   { value: 256, label: t('option.thumbnail256') },
 ])
+const navigatorModeOptions = computed(() => [
+  { value: 'always', label: t('option.navigatorAlways') },
+  { value: 'auto', label: t('option.navigatorAuto') },
+  { value: 'hidden', label: t('option.navigatorHidden') },
+])
+const navigatorSizeOptions = [160, 200, 240].map(value => ({ value, label: `${value}px` }))
 
 async function handleSave() {
   try {
@@ -102,6 +108,9 @@ function handleCancel() {
           <a-form-item :label="t('settings.smoothZoom')"><a-switch v-model:checked="draft.viewer.smoothZoom" /></a-form-item>
           <a-form-item :label="t('settings.zoomToCursor')"><a-switch v-model:checked="draft.viewer.zoomToCursor" /></a-form-item>
           <a-form-item :label="t('settings.resetZoomOnSwitch')"><a-switch v-model:checked="draft.viewer.resetZoomOnSwitch" /></a-form-item>
+          <a-form-item :label="t('settings.navigatorMode')"><a-select v-model:value="draft.viewer.navigatorMode" :options="navigatorModeOptions" /></a-form-item>
+          <a-form-item :label="t('settings.navigatorSize')"><a-select v-model:value="draft.viewer.navigatorSize" :options="navigatorSizeOptions" /></a-form-item>
+          <a-form-item :label="t('settings.confirmDelete')"><a-switch v-model:checked="draft.viewer.confirmDelete" /></a-form-item>
         </a-form>
       </a-tab-pane>
 

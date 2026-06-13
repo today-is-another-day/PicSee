@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type {
   ImageEntry,
   OpenDirectoryCommandResult,
+  OpenDirectoryResult,
   OpenImageFileResult,
   ScanDirectoryResult,
 } from '@/types/image'
@@ -77,6 +78,30 @@ export const useDirectoryStore = defineStore('directory', () => {
     }
   }
 
+  async function openExternalPath(path: string) {
+    scanToken += 1
+    beginOperation()
+    error.value = null
+    try {
+      const result = await invoke<OpenDirectoryResult>('open_external_path', { path })
+      currentPath.value = result.directory
+      entries.value = result.entries
+      currentIndex.value = result.entries.length ? 0 : -1
+      if (result.entries.length === 1) void scanDirectory(result.directory)
+    } catch (reason) {
+      error.value = reason
+    } finally {
+      endOperation()
+    }
+  }
+
+  function removeCurrent() {
+    if (currentIndex.value < 0) return
+    const index = currentIndex.value
+    entries.value.splice(index, 1)
+    currentIndex.value = entries.value.length ? Math.min(index, entries.value.length - 1) : -1
+  }
+
   function select(index: number) {
     if (index >= 0 && index < entries.value.length) currentIndex.value = index
   }
@@ -109,6 +134,8 @@ export const useDirectoryStore = defineStore('directory', () => {
     openImageFile,
     openDirectory,
     scanDirectory,
+    openExternalPath,
+    removeCurrent,
     select,
     selectPrevious,
     selectNext,

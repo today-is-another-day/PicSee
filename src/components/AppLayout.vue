@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
 
 import ImageCanvasViewer from './ImageCanvasViewer.vue'
@@ -16,6 +18,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useLargeImage } from '@/composables/useLargeImage'
+import { useFileOperations } from '@/composables/useFileOperations'
 
 const appStore = useAppStore()
 const { t } = useI18n()
@@ -26,6 +29,9 @@ const { currentEntry } = storeToRefs(directoryStore)
 const { error: directoryError } = storeToRefs(directoryStore)
 const { settings } = storeToRefs(settingsStore)
 const { closeCurrentLargeImage, openImage } = useLargeImage()
+const fileOperations = useFileOperations()
+let unlistenOpenPaths: UnlistenFn | null = null
+let unlistenDrop: UnlistenFn | null = null
 
 const layoutClasses = computed(() => ({
   'app-layout--compact': settings.value.layout.compactMode,
@@ -129,6 +135,21 @@ function handleKeydown(event: KeyboardEvent) {
     appStore.openSettings()
     return
   }
+  if (command && event.shiftKey && event.key.toLowerCase() === 'r') {
+    event.preventDefault()
+    void fileOperations.revealCurrent()
+    return
+  }
+  if (command && event.key.toLowerCase() === 'c') {
+    event.preventDefault()
+    void fileOperations.copyCurrentFile()
+    return
+  }
+  if ((event.key === 'Delete' || (command && event.key === 'Backspace'))) {
+    event.preventDefault()
+    void fileOperations.deleteCurrent()
+    return
+  }
   if (command || event.altKey) return
 
   // 方向键 auto-repeat 节流（各键独立时间戳，互不干扰）
@@ -154,6 +175,8 @@ function handleKeydown(event: KeyboardEvent) {
     '1': () => viewerStore.applyDisplayMode('actual-size'),
     f: () => void toggleFullscreen(),
     F: () => void toggleFullscreen(),
+    r: fileOperations.rotateClockwise,
+    R: fileOperations.rotateCounterClockwise,
     Escape: () => {
       if (viewerStore.isFullscreen) void toggleFullscreen(false)
     },
@@ -177,8 +200,21 @@ onMounted(async () => {
   } catch {
     viewerStore.setFullscreen(false)
   }
+  const openPaths = (paths: string[]) => {
+    const path = paths[0]
+    if (path) void directoryStore.openExternalPath(path)
+  }
+  unlistenOpenPaths = await listen<string[]>('open-paths', event => openPaths(event.payload))
+  unlistenDrop = await getCurrentWindow().onDragDropEvent(event => {
+    if (event.payload.type === 'drop') openPaths(event.payload.paths)
+  })
+  openPaths(await invoke<string[]>('take_pending_open_paths'))
 })
-onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeydown)
+  unlistenOpenPaths?.()
+  unlistenDrop?.()
+})
 </script>
 
 <template>

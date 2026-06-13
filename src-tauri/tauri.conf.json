@@ -29,6 +29,14 @@
   },
   "bundle": {
     "active": true,
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png"],
+    "fileAssociations": [
+      {
+        "ext": ["jpg", "jpeg", "png", "webp", "gif", "bmp", "svg", "tiff", "tif", "heic", "heif", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef"],
+        "name": "Image",
+        "role": "Viewer",
+        "rank": "Default"
+      }
+    ]
   }
 }

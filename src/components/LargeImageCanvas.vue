@@ -34,7 +34,7 @@ const props = defineProps<{
 // ─── Stores ───────────────────────────────────────────────────────
 const viewerStore = useViewerStore()
 const settingsStore = useSettingsStore()
-const { zoom, offset, viewport } = storeToRefs(viewerStore)
+const { zoom, offset, rotation, viewport } = storeToRefs(viewerStore)
 
 // ─── Canvas ref ───────────────────────────────────────────────────
 const canvasRef = useTemplateRef<HTMLCanvasElement>('canvas')
@@ -207,13 +207,20 @@ function render() {
   const ox = offset.value.x
   const oy = offset.value.y
 
+  const applySourceTransform = () => {
+    const s = z * dpr
+    if (rotation.value === 90) ctx.setTransform(0, s, -s, 0, (ox + imgH * z) * dpr, oy * dpr)
+    else if (rotation.value === 180) ctx.setTransform(-s, 0, 0, -s, (ox + imgW * z) * dpr, (oy + imgH * z) * dpr)
+    else if (rotation.value === 270) ctx.setTransform(0, -s, s, 0, ox * dpr, (oy + imgW * z) * dpr)
+    else ctx.setTransform(s, 0, 0, s, ox * dpr, oy * dpr)
+  }
+
   // ── 底层：preview（拉伸到当前视口对应区域，作为 fallback）──────────
   if (previewLoaded.value && previewImg.value) {
-    const canvasX = ox * dpr
-    const canvasY = oy * dpr
-    const canvasW = imgW * z * dpr
-    const canvasH = imgH * z * dpr
-    ctx.drawImage(previewImg.value, canvasX, canvasY, canvasW, canvasH)
+    ctx.save()
+    applySourceTransform()
+    ctx.drawImage(previewImg.value, 0, 0, imgW, imgH)
+    ctx.restore()
   }
 
   // ── 上层：tile（已缓存的直接画，避免闪烁）───────────────────────
@@ -224,6 +231,7 @@ function render() {
   const visibleTileCount = Math.max(0, tx1 - tx0 + 1) * Math.max(0, ty1 - ty0 + 1)
   const previewScale = computePreviewScale()
   const needTiles = props.session.tileable
+    && rotation.value === 0
     && zoom.value * dpr > previewScale
     // TODO M6：引入 z 级 LOD 后移除此低倍率保护。
     && visibleTileCount <= Math.floor(TILE_CACHE_LIMIT * 0.7)
@@ -242,13 +250,10 @@ function render() {
         const tileW = Math.min(tileSize, imgW - tileX)
         const tileH = Math.min(tileSize, imgH - tileY)
 
-        // 转换到 canvas 物理像素坐标
-        const canvasX = (tileX * z + ox) * dpr
-        const canvasY = (tileY * z + oy) * dpr
-        const canvasW = tileW * z * dpr
-        const canvasH = tileH * z * dpr
-
-        ctx.drawImage(cached, canvasX, canvasY, canvasW, canvasH)
+        ctx.save()
+        applySourceTransform()
+        ctx.drawImage(cached, tileX, tileY, tileW, tileH)
+        ctx.restore()
       }
     }
   }
@@ -318,7 +323,7 @@ function loadPreview() {
 // ─── 生命周期 & 响应式 ────────────────────────────────────────────
 
 // zoom/offset/viewport 变化时请求重绘（合批）
-watch([zoom, offset, viewport], () => {
+watch([zoom, offset, rotation, viewport], () => {
   scheduleRender()
 }, { deep: true })
 

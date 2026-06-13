@@ -1,15 +1,25 @@
+pub mod file_operations;
 pub mod images;
 pub mod large_image;
 pub mod settings;
 pub mod thumbnails;
 
-use images::{open_directory, open_image_file, scan_directory};
+use file_operations::{copy_file_to_clipboard, move_to_trash, reveal_in_finder};
+use images::{open_directory, open_external_path, open_image_file, scan_directory};
 use large_image::policy::probe_image;
 use large_image::session::{close_large_image, open_large_image, LargeImageState};
 use settings::{get_settings, read_settings_file, save_settings};
 use std::sync::{Arc, Mutex};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use thumbnails::{clear_thumbnail_cache, get_thumbnail, ThumbnailState};
+
+#[derive(Default)]
+struct PendingOpenPaths(Mutex<Vec<String>>);
+
+#[tauri::command]
+fn take_pending_open_paths(state: tauri::State<'_, PendingOpenPaths>) -> Vec<String> {
+    std::mem::take(&mut *state.0.lock().unwrap())
+}
 
 /// 从 picsee:// URL 中提取路径部分（不含 query string）。
 fn extract_picsee_path(url: &str) -> &str {
@@ -162,6 +172,9 @@ pub fn run() {
                 tile_concurrency,
                 memory_limit_mb,
             ))));
+            app.manage(PendingOpenPaths(Mutex::new(images::extract_open_paths(
+                std::env::args(),
+            ))));
 
             // 授权缩略图缓存目录
             if let Ok(cache_dir) = app.path().app_cache_dir() {
@@ -179,14 +192,41 @@ pub fn run() {
             open_image_file,
             open_directory,
             scan_directory,
+            open_external_path,
+            move_to_trash,
+            reveal_in_finder,
+            copy_file_to_clipboard,
             get_thumbnail,
             clear_thumbnail_cache,
             probe_image,
             open_large_image,
             close_large_image,
+            take_pending_open_paths,
         ])
-        .run(tauri::generate_context!())
-        .expect("Error running PicSee");
+        .build(tauri::generate_context!())
+        .expect("Error building PicSee")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = event {
+                let paths: Vec<String> = urls
+                    .into_iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                if !paths.is_empty() {
+                    app.state::<PendingOpenPaths>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .extend(paths.clone());
+                    let _ = app.emit("open-paths", paths);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]

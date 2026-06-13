@@ -7,11 +7,14 @@ import { useImageStore } from '@/stores/image'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import LargeImageCanvas from '@/components/LargeImageCanvas.vue'
+import NavigatorOverlay from '@/components/NavigatorOverlay.vue'
+import { useFileOperations } from '@/composables/useFileOperations'
 
 const { t } = useI18n()
 const imageStore = useImageStore()
 const settingsStore = useSettingsStore()
 const viewerStore = useViewerStore()
+const fileOperations = useFileOperations()
 const { error, hasImage, loading, src, loadMode, largeImageSession } = storeToRefs(imageStore)
 const viewer = useTemplateRef<HTMLElement>('viewer')
 let resizeObserver: ResizeObserver | null = null
@@ -20,13 +23,47 @@ const errorMessage = computed(() => {
   if (error.value instanceof Error) return error.value.message
   return t('placeholder.imageError')
 })
+const menuItems = computed(() => [
+  { key: 'rotate-clockwise', label: t('file.rotateClockwise') },
+  { key: 'rotate-counter-clockwise', label: t('file.rotateCounterClockwise') },
+  { type: 'divider' as const },
+  { key: 'reveal', label: t('file.reveal') },
+  { key: 'copy-file', label: t('file.copyFile') },
+  { key: 'copy-path', label: t('file.copyPath') },
+  { type: 'divider' as const },
+  { key: 'delete', label: t('file.delete'), danger: true },
+])
 
-const imageStyle = computed(() => ({
-  width: `${imageStore.naturalWidth}px`,
-  height: `${imageStore.naturalHeight}px`,
+function handleMenu({ key }: { key: string }) {
+  const actions: Record<string, () => void> = {
+    'rotate-clockwise': fileOperations.rotateClockwise,
+    'rotate-counter-clockwise': fileOperations.rotateCounterClockwise,
+    reveal: () => void fileOperations.revealCurrent(),
+    'copy-file': () => void fileOperations.copyCurrentFile(),
+    'copy-path': () => void fileOperations.copyCurrentPath(),
+    delete: () => void fileOperations.deleteCurrent(),
+  }
+  actions[key]?.()
+}
+
+const imageFrameStyle = computed(() => ({
+  width: `${viewerStore.displayImage.width}px`,
+  height: `${viewerStore.displayImage.height}px`,
   transform: `translate(${viewerStore.offset.x}px, ${viewerStore.offset.y}px) scale(${viewerStore.zoom})`,
   transition: settingsStore.settings.viewer.smoothZoom && !viewerStore.isDragging ? 'transform 100ms ease-out' : 'none',
 }))
+const imageStyle = computed(() => ({
+  width: `${imageStore.naturalWidth}px`,
+  height: `${imageStore.naturalHeight}px`,
+  transform: rotationTransform(viewerStore.rotation, imageStore.naturalWidth, imageStore.naturalHeight),
+}))
+
+function rotationTransform(rotation: number, width: number, height: number) {
+  if (rotation === 90) return `translate(${height}px, 0) rotate(90deg)`
+  if (rotation === 180) return `translate(${width}px, ${height}px) rotate(180deg)`
+  if (rotation === 270) return `translate(0, ${width}px) rotate(270deg)`
+  return 'none'
+}
 
 function updateViewport() {
   if (!viewer.value) return
@@ -96,33 +133,32 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
 </script>
 
 <template>
-  <section
-    ref="viewer"
-    class="image-viewer"
-    :class="{ 'image-viewer--dragging': viewerStore.isDragging }"
-    @dblclick="handleDoubleClick"
-    @pointerdown="handlePointerDown"
-    @pointermove="handlePointerMove"
-    @pointerup="handlePointerUp"
-    @pointercancel="handlePointerUp"
-    @wheel="handleWheel"
-  >
-    <!-- 普通图片路径（loadMode=normal 或 null） -->
-    <img
-      v-if="hasImage && loadMode === 'normal' && src"
-      class="image-viewer__image"
-      :src="src"
-      :style="imageStyle"
-      :alt="imageStore.metadata?.name"
-      draggable="false"
-      @load="handleLoad"
-      @error="handleError"
+  <a-dropdown :trigger="['contextmenu']">
+    <section
+      ref="viewer"
+      class="image-viewer"
+      :class="{ 'image-viewer--dragging': viewerStore.isDragging }"
+      @dblclick="handleDoubleClick"
+      @pointerdown="handlePointerDown"
+      @pointermove="handlePointerMove"
+      @pointerup="handlePointerUp"
+      @pointercancel="handlePointerUp"
+      @wheel="handleWheel"
     >
+    <!-- 普通图片路径（loadMode=normal 或 null） -->
+    <div
+      v-if="hasImage && loadMode === 'normal' && src"
+      class="image-viewer__frame"
+      :style="imageFrameStyle"
+    >
+      <img class="image-viewer__image" :src="src" :style="imageStyle" :alt="imageStore.metadata?.name" draggable="false" @load="handleLoad" @error="handleError">
+    </div>
     <!-- 大图路径：canvas 渲染 -->
     <LargeImageCanvas
       v-else-if="hasImage && largeImageSession"
       :session="largeImageSession"
     />
+    <NavigatorOverlay />
     <!-- loading 状态：probe 或 open_large_image 期间 -->
     <a-spin v-if="loading" class="image-viewer__state" size="large" />
     <a-result v-else-if="error" class="image-viewer__state" status="error" :sub-title="errorMessage" />
@@ -131,7 +167,11 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
       <h1 class="image-viewer__title">{{ t('placeholder.viewerTitle') }}</h1>
       <p class="image-viewer__description">{{ t('placeholder.viewerDescription') }}</p>
     </div>
-  </section>
+    </section>
+    <template #overlay>
+      <a-menu :items="menuItems" @click="handleMenu" />
+    </template>
+  </a-dropdown>
 </template>
 
 <style scoped>
@@ -152,17 +192,16 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
   cursor: grabbing;
 }
 
-.image-viewer__image {
+.image-viewer__frame {
   position: absolute;
   top: 0;
   left: 0;
   max-width: none;
   transform-origin: 0 0;
-  image-rendering: auto;
-  image-orientation: from-image;
   pointer-events: none;
   will-change: transform;
 }
+.image-viewer__image { position: absolute; top: 0; left: 0; max-width: none; transform-origin: 0 0; image-rendering: auto; image-orientation: from-image; }
 
 .image-viewer__state,
 .image-viewer__placeholder {

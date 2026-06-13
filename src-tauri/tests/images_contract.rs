@@ -1,5 +1,6 @@
 use picsee_lib::images::{
-    collect_image_entries, is_supported_image, natural_compare, scan_directory_entries,
+    collect_image_entries, extract_open_paths, is_supported_image, natural_compare,
+    scan_directory_entries,
 };
 use std::{
     cmp::Ordering,
@@ -27,6 +28,25 @@ fn supported_image_filter_is_case_insensitive_and_rejects_other_files() {
             "{name} 不应被识别为图片"
         );
     }
+}
+
+#[test]
+fn argv_path_extraction_keeps_supported_existing_paths() {
+    let directory = test_directory("argv");
+    std::fs::create_dir_all(&directory).expect("应创建测试目录");
+    let image = directory.join("open.png");
+    let ignored = directory.join("ignored.txt");
+    std::fs::write(&image, b"png").unwrap();
+    std::fs::write(&ignored, b"text").unwrap();
+
+    let paths = extract_open_paths([
+        "picsee".to_string(),
+        image.to_string_lossy().into_owned(),
+        ignored.to_string_lossy().into_owned(),
+    ]);
+
+    assert_eq!(paths, vec![image.to_string_lossy().into_owned()]);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

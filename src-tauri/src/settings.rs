@@ -56,6 +56,22 @@ pub enum DefaultZoomMode {
     Remember,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NavigatorMode {
+    Always,
+    Auto,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u32)]
+pub enum NavigatorSize {
+    Size160 = 160,
+    Size200 = 200,
+    Size240 = 240,
+}
+
 /// 缩略图栏位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -105,6 +121,12 @@ pub struct ViewerSettings {
     pub zoom_to_cursor: bool,
     /// 切换图片时是否重置缩放。
     pub reset_zoom_on_switch: bool,
+    /// 导航窗显示模式。
+    pub navigator_mode: NavigatorMode,
+    /// 导航窗长边尺寸。
+    pub navigator_size: NavigatorSize,
+    /// 删除前是否确认。
+    pub confirm_delete: bool,
 }
 
 /// 大图处理设置。
@@ -198,6 +220,9 @@ impl Default for ViewerSettings {
             smooth_zoom: true,
             zoom_to_cursor: true,
             reset_zoom_on_switch: true,
+            navigator_mode: NavigatorMode::Auto,
+            navigator_size: NavigatorSize::Size200,
+            confirm_delete: false,
         }
     }
 }
