@@ -30,7 +30,10 @@ pub struct ThumbnailError {
 
 impl ThumbnailError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -100,26 +103,38 @@ pub async fn get_thumbnail(
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "svg" {
-        return Err(ThumbnailError::new("UNSUPPORTED_FORMAT", "SVG files should be displayed directly by the frontend"));
+        return Err(ThumbnailError::new(
+            "UNSUPPORTED_FORMAT",
+            "SVG files should be displayed directly by the frontend",
+        ));
     }
     if !THUMBNAIL_EXTENSIONS.contains(&ext.as_str()) {
-        return Err(ThumbnailError::new("UNSUPPORTED_FORMAT", format!("Unsupported format: {ext}")));
+        return Err(ThumbnailError::new(
+            "UNSUPPORTED_FORMAT",
+            format!("Unsupported format: {ext}"),
+        ));
     }
 
     // Minor 9: use canonical path for NOT_ALLOWED check to avoid symlink bypass.
-    let canonical = fs::canonicalize(&file_path)
-        .unwrap_or_else(|_| file_path.clone());
+    let canonical = fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
     if !app.asset_protocol_scope().is_allowed(&canonical) {
-        return Err(ThumbnailError::new("NOT_ALLOWED", format!("Path not authorized: {path}")));
+        return Err(ThumbnailError::new(
+            "NOT_ALLOWED",
+            format!("Path not authorized: {path}"),
+        ));
     }
 
     // Read file metadata to compute cache key.
-    let metadata = fs::metadata(&file_path)
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to read file metadata: {e}")))?;
+    let metadata = fs::metadata(&file_path).map_err(|e| {
+        ThumbnailError::new("IO_ERROR", format!("Failed to read file metadata: {e}"))
+    })?;
 
     let file_size = metadata.len();
     if file_size > MAX_FILE_BYTES {
-        return Err(ThumbnailError::new("FILE_TOO_LARGE", "File exceeds 100 MB; thumbnail skipped"));
+        return Err(ThumbnailError::new(
+            "FILE_TOO_LARGE",
+            "File exceeds 100 MB; thumbnail skipped",
+        ));
     }
 
     let modified = metadata
@@ -138,7 +153,9 @@ pub async fn get_thumbnail(
     let cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to get cache directory: {e}")))?
+        .map_err(|e| {
+            ThumbnailError::new("IO_ERROR", format!("Failed to get cache directory: {e}"))
+        })?
         .join("thumbnails");
     let cache_file = cache_dir.join(format!("{cache_key}.webp"));
 
@@ -165,9 +182,12 @@ pub async fn get_thumbnail(
 
     if let Some(mut rx) = maybe_rx {
         // Wait for the existing task to complete.
-        rx.changed()
-            .await
-            .map_err(|_| ThumbnailError::new("IO_ERROR", "Channel closed while waiting for thumbnail task"))?;
+        rx.changed().await.map_err(|_| {
+            ThumbnailError::new(
+                "IO_ERROR",
+                "Channel closed while waiting for thumbnail task",
+            )
+        })?;
         let result: InFlightResult = rx.borrow().clone();
         return match result {
             Some(Ok(out_path)) => {
@@ -176,7 +196,10 @@ pub async fn get_thumbnail(
             }
             // M2: forward the original error code faithfully instead of collapsing to DECODE_ERROR.
             Some(Err((code, msg))) => Err(ThumbnailError::new(code, msg)),
-            None => Err(ThumbnailError::new("IO_ERROR", "Thumbnail task produced no result")),
+            None => Err(ThumbnailError::new(
+                "IO_ERROR",
+                "Thumbnail task produced no result",
+            )),
         };
     }
 
@@ -233,7 +256,9 @@ pub async fn clear_thumbnail_cache(app: AppHandle) -> Result<u64, ThumbnailError
     let cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to get cache directory: {e}")))?
+        .map_err(|e| {
+            ThumbnailError::new("IO_ERROR", format!("Failed to get cache directory: {e}"))
+        })?
         .join("thumbnails");
 
     if !cache_dir.exists() {
@@ -242,8 +267,8 @@ pub async fn clear_thumbnail_cache(app: AppHandle) -> Result<u64, ThumbnailError
 
     let freed = tauri::async_runtime::spawn_blocking(move || {
         let mut total: u64 = 0;
-        let entries = fs::read_dir(&cache_dir)
-            .map_err(|e| format!("Failed to read cache directory: {e}"))?;
+        let entries =
+            fs::read_dir(&cache_dir).map_err(|e| format!("Failed to read cache directory: {e}"))?;
         for entry in entries.filter_map(Result::ok) {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
@@ -400,7 +425,12 @@ pub fn read_exif_orientation(raw: &[u8]) -> Option<u32> {
 fn ensure_cache_scope(app: &AppHandle, cache_dir: &Path) -> Result<(), ThumbnailError> {
     app.asset_protocol_scope()
         .allow_directory(cache_dir, false)
-        .map_err(|e| ThumbnailError::new("IO_ERROR", format!("Failed to authorize cache directory: {e}")))
+        .map_err(|e| {
+            ThumbnailError::new(
+                "IO_ERROR",
+                format!("Failed to authorize cache directory: {e}"),
+            )
+        })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -421,7 +451,9 @@ mod tests {
             ImageBuffer::from_fn(width, height, |x, _| Rgb([x as u8, 50u8, 100u8]));
         let dyn_img = image::DynamicImage::ImageRgb8(img);
         let mut buf = std::io::Cursor::new(Vec::new());
-        dyn_img.write_to(&mut buf, ImageFormat::Jpeg).expect("JPEG encoding should succeed");
+        dyn_img
+            .write_to(&mut buf, ImageFormat::Jpeg)
+            .expect("JPEG encoding should succeed");
         buf.into_inner()
     }
 
@@ -439,7 +471,10 @@ mod tests {
         let path = Path::new("/tmp/test.jpg");
         let k96 = compute_cache_key(path, 100, 0, 96);
         let k160 = compute_cache_key(path, 100, 0, 160);
-        assert_ne!(k96, k160, "Different sizes must produce different cache keys");
+        assert_ne!(
+            k96, k160,
+            "Different sizes must produce different cache keys"
+        );
     }
 
     #[test]
@@ -458,7 +493,11 @@ mod tests {
         let img = image::load_from_memory(&jpeg).expect("Failed to load test JPEG");
         let (w, h) = img.dimensions();
         let oriented = apply_exif_orientation(img, &jpeg);
-        assert_eq!(oriented.dimensions(), (w, h), "Orientation 1 must not change dimensions");
+        assert_eq!(
+            oriented.dimensions(),
+            (w, h),
+            "Orientation 1 must not change dimensions"
+        );
     }
 
     #[test]
@@ -478,7 +517,10 @@ mod tests {
             &cache_file,
             96,
         );
-        assert!(result.is_ok(), "Tiny JPEG should generate thumbnail successfully: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Tiny JPEG should generate thumbnail successfully: {result:?}"
+        );
     }
 
     #[test]
@@ -526,7 +568,8 @@ mod tests {
 
         // Write garbage bytes as a .jpg file.
         let mut tmp = NamedTempFile::with_suffix(".jpg").expect("NamedTempFile");
-        tmp.write_all(b"not a real jpeg at all garbage bytes").expect("write");
+        tmp.write_all(b"not a real jpeg at all garbage bytes")
+            .expect("write");
 
         let result = generate_thumbnail(
             tmp.path().to_str().unwrap(),
@@ -542,4 +585,3 @@ mod tests {
         }
     }
 }
-

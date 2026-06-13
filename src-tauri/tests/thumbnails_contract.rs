@@ -26,7 +26,9 @@ fn make_png_bytes(width: u32, height: u32) -> Vec<u8> {
         ImageBuffer::from_fn(width, height, |_, _| Rgb([255u8, 0u8, 0u8]));
     let dyn_img = image::DynamicImage::ImageRgb8(img);
     let mut buf = Cursor::new(Vec::new());
-    dyn_img.write_to(&mut buf, ImageFormat::Png).expect("PNG 编码应成功");
+    dyn_img
+        .write_to(&mut buf, ImageFormat::Png)
+        .expect("PNG 编码应成功");
     buf.into_inner()
 }
 
@@ -37,7 +39,9 @@ fn make_jpeg_bytes(width: u32, height: u32) -> Vec<u8> {
         ImageBuffer::from_fn(width, height, |x, _| Rgb([x as u8, 50u8, 100u8]));
     let dyn_img = image::DynamicImage::ImageRgb8(img);
     let mut buf = Cursor::new(Vec::new());
-    dyn_img.write_to(&mut buf, ImageFormat::Jpeg).expect("JPEG 编码应成功");
+    dyn_img
+        .write_to(&mut buf, ImageFormat::Jpeg)
+        .expect("JPEG 编码应成功");
     buf.into_inner()
 }
 
@@ -52,7 +56,10 @@ fn cache_key_is_deterministic_for_same_inputs() {
     let key2 = compute_cache_key(path, 102400, 1700000000000, 160);
     assert_eq!(key1, key2, "相同输入应产生相同 key");
     assert_eq!(key1.len(), 32, "cache key 应为 32 字符十六进制");
-    assert!(key1.chars().all(|c| c.is_ascii_hexdigit()), "cache key 应只包含 hex 字符");
+    assert!(
+        key1.chars().all(|c| c.is_ascii_hexdigit()),
+        "cache key 应只包含 hex 字符"
+    );
 }
 
 #[test]
@@ -96,8 +103,7 @@ fn generate_thumbnail_png_produces_webp_within_size_limit() {
 
     let cache_dir = dir.join("cache");
     let cache_file = cache_dir.join("test_thumb.webp");
-    let result =
-        generate_thumbnail(src.to_str().unwrap(), &cache_dir, &cache_file, 160);
+    let result = generate_thumbnail(src.to_str().unwrap(), &cache_dir, &cache_file, 160);
     assert!(result.is_ok(), "PNG 缩略图生成应成功: {:?}", result.err());
     let out_path = result.unwrap();
     assert!(out_path.exists(), "缩略图文件应存在");
@@ -281,7 +287,11 @@ fn thumbnail_error_serializes_to_expected_json_shape() {
     // 确认 camelCase 且无多余字段
     assert!(json.get("code").is_some());
     assert!(json.get("message").is_some());
-    assert_eq!(json.as_object().unwrap().len(), 2, "只应有 code 和 message 两个字段");
+    assert_eq!(
+        json.as_object().unwrap().len(),
+        2,
+        "只应有 code 和 message 两个字段"
+    );
 }
 
 #[test]
@@ -296,7 +306,10 @@ fn thumbnail_error_codes_cover_known_variants() {
         "FILE_TOO_LARGE",
         "DECODE_ERROR",
     ] {
-        let err = ThumbnailError { code, message: format!("测试 {code}") };
+        let err = ThumbnailError {
+            code,
+            message: format!("测试 {code}"),
+        };
         let json = serde_json::to_value(&err).expect("应可序列化");
         assert_eq!(json["code"], code, "code 字段应匹配");
     }
@@ -314,7 +327,9 @@ fn decode_gif_produces_first_frame() {
         ImageBuffer::from_fn(40, 30, |_, _| Rgb([0u8, 128u8, 0u8]));
     let dyn_img = image::DynamicImage::ImageRgb8(frame);
     let mut buf = Cursor::new(Vec::new());
-    dyn_img.write_to(&mut buf, ImageFormat::Gif).expect("GIF 编码应成功");
+    dyn_img
+        .write_to(&mut buf, ImageFormat::Gif)
+        .expect("GIF 编码应成功");
     let gif_bytes = buf.into_inner();
 
     let img = decode_image(&gif_bytes, "gif", Path::new("test.gif"));
