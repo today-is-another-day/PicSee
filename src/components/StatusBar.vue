@@ -5,11 +5,13 @@ import { useI18n } from 'vue-i18n'
 import { useDirectoryStore } from '@/stores/directory'
 import { useImageStore } from '@/stores/image'
 import { useViewerStore } from '@/stores/viewer'
+import { storeToRefs } from 'pinia'
 
 const { t } = useI18n()
 const directoryStore = useDirectoryStore()
 const imageStore = useImageStore()
 const viewerStore = useViewerStore()
+const { loadMode } = storeToRefs(imageStore)
 const resolution = computed(() => imageStore.naturalWidth && imageStore.naturalHeight
   ? `${imageStore.naturalWidth} × ${imageStore.naturalHeight}`
   : '-')
@@ -37,6 +39,9 @@ function formatFileSize(bytes?: number) {
     <span>{{ t('status.resolution') }}: {{ resolution }}</span>
     <span>{{ t('status.zoom') }}: {{ zoom }}</span>
     <span>{{ t('status.fileSize') }}: {{ fileSize }}</span>
+    <span v-if="loadMode && loadMode !== 'normal'" class="status-bar__badge">
+      {{ t('status.largeImageMode') }}
+    </span>
   </footer>
 </template>
 
@@ -55,5 +60,13 @@ function formatFileSize(bytes?: number) {
 
 .status-bar span:first-child {
   margin-right: auto;
+}
+
+.status-bar__badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, #1677ff 15%, transparent);
+  color: #1677ff;
+  font-size: 11px;
 }
 </style>

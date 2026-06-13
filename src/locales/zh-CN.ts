@@ -11,7 +11,7 @@ export default {
     noImage: '未打开图片',
     imageError: '图片加载失败。',
   },
-  status: { fileName: '文件名', index: '序号', resolution: '分辨率', zoom: '缩放比', fileSize: '文件大小' },
+  status: { fileName: '文件名', index: '序号', resolution: '分辨率', zoom: '缩放比', fileSize: '文件大小', largeImageMode: '大图模式' },
   directory: { openFailed: '打开或扫描图片目录失败' },
   thumbnail: {
     error: '缩略图生成失败',

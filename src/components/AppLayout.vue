@@ -16,6 +16,7 @@ import { useImageStore } from '@/stores/image'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import { convertFileSrc } from '@tauri-apps/api/core'
+import { useLargeImage } from '@/composables/useLargeImage'
 
 const appStore = useAppStore()
 const { t } = useI18n()
@@ -26,6 +27,7 @@ const viewerStore = useViewerStore()
 const { currentEntry } = storeToRefs(directoryStore)
 const { error: directoryError } = storeToRefs(directoryStore)
 const { settings } = storeToRefs(settingsStore)
+const { openImage } = useLargeImage()
 
 const layoutClasses = computed(() => ({
   'app-layout--compact': settings.value.layout.compactMode,
@@ -47,7 +49,12 @@ watch(() => currentEntry.value?.path, (path, previousPath) => {
       viewerStore.preserveView()
     }
   }
-  imageStore.setCurrent(currentEntry.value)
+  if (currentEntry.value) {
+    void openImage(currentEntry.value)
+  }
+  else {
+    imageStore.setCurrent(null)
+  }
 }, { immediate: true })
 
 watch(directoryError, (error) => {

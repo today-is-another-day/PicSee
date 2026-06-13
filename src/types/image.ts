@@ -28,3 +28,33 @@ export interface ThumbnailBackendError {
     | string
   message: string
 }
+
+// ─── 大图引擎类型（M4）───────────────────────────────────────────
+
+/** probe_image 返回的加载模式。 */
+export type LoadMode = 'normal' | 'largeCandidate' | 'tileRequired'
+
+/** probe_image command 返回值。 */
+export interface ImageProbe {
+  width: number
+  height: number
+  format: string
+  fileSize: number
+  isLarge: boolean
+  loadMode: LoadMode
+}
+
+/** open_large_image command 返回值。 */
+export interface OpenLargeImageResult {
+  sessionId: number
+  generation: number
+  width: number
+  height: number
+  tileSize: number
+  previewMaxSize: number
+}
+
+/** 前端维护的大图会话状态。 */
+export interface LargeImageSession extends OpenLargeImageResult {
+  path: string
+}

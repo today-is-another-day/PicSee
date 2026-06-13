@@ -11,7 +11,7 @@ export default {
     noImage: 'No image opened',
     imageError: 'The image could not be loaded.',
   },
-  status: { fileName: 'File', index: 'Index', resolution: 'Resolution', zoom: 'Zoom', fileSize: 'File size' },
+  status: { fileName: 'File', index: 'Index', resolution: 'Resolution', zoom: 'Zoom', fileSize: 'File size', largeImageMode: 'Large image mode' },
   directory: { openFailed: 'Could not open or scan the image folder' },
   thumbnail: {
     error: 'Thumbnail generation failed',

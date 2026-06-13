@@ -151,3 +151,6 @@ src-tauri/gen/schemas
 
 # Claude session artifacts
 .claude/
+
+# 测试用大图文件（不提交到版本库）
+test-assets/

@@ -6,12 +6,13 @@ import { useI18n } from 'vue-i18n'
 import { useImageStore } from '@/stores/image'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
+import LargeImageCanvas from '@/components/LargeImageCanvas.vue'
 
 const { t } = useI18n()
 const imageStore = useImageStore()
 const settingsStore = useSettingsStore()
 const viewerStore = useViewerStore()
-const { error, hasImage, loading, src } = storeToRefs(imageStore)
+const { error, hasImage, loading, src, loadMode, largeImageSession } = storeToRefs(imageStore)
 const viewer = useTemplateRef<HTMLElement>('viewer')
 let resizeObserver: ResizeObserver | null = null
 let dragPoint: { x: number; y: number } | null = null
@@ -102,8 +103,9 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
     @pointercancel="handlePointerUp"
     @wheel="handleWheel"
   >
+    <!-- 普通图片路径（loadMode=normal 或 null） -->
     <img
-      v-if="hasImage"
+      v-if="hasImage && loadMode === 'normal' && src"
       class="image-viewer__image"
       :src="src"
       :style="imageStyle"
@@ -112,6 +114,12 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
       @load="handleLoad"
       @error="handleError"
     >
+    <!-- 大图路径：canvas 渲染 -->
+    <LargeImageCanvas
+      v-else-if="hasImage && largeImageSession"
+      :session="largeImageSession"
+    />
+    <!-- loading 状态：probe 或 open_large_image 期间 -->
     <a-spin v-if="loading" class="image-viewer__state" size="large" />
     <a-result v-else-if="error" class="image-viewer__state" status="error" :sub-title="t('placeholder.imageError')" />
     <div v-else-if="!hasImage" class="image-viewer__placeholder">
