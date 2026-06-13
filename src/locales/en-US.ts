@@ -22,6 +22,17 @@ export default {
     errorNotAllowed: 'Path is not authorized',
     errorIo: 'An I/O error occurred while reading or writing the thumbnail',
   },
+  largeImage: {
+    errors: {
+      SESSION_NOT_FOUND: 'The large-image session has expired',
+      TILE_OUT_OF_RANGE: 'The requested image tile is out of range',
+      TILES_UNAVAILABLE: 'This image format only supports preview rendering',
+      UNSUPPORTED_FORMAT: 'This large-image format is not supported',
+      IO_ERROR: 'An error occurred while reading the large image',
+      DECODE_ERROR: 'The large image could not be decoded',
+      ENCODE_ERROR: 'The large-image preview could not be encoded',
+    },
+  },
   settings: {
     title: 'Settings',
     saved: 'Settings saved',

@@ -16,6 +16,10 @@ const { error, hasImage, loading, src, loadMode, largeImageSession } = storeToRe
 const viewer = useTemplateRef<HTMLElement>('viewer')
 let resizeObserver: ResizeObserver | null = null
 let dragPoint: { x: number; y: number } | null = null
+const errorMessage = computed(() => {
+  if (error.value instanceof Error) return error.value.message
+  return t('placeholder.imageError')
+})
 
 const imageStyle = computed(() => ({
   width: `${imageStore.naturalWidth}px`,
@@ -121,7 +125,7 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
     />
     <!-- loading 状态：probe 或 open_large_image 期间 -->
     <a-spin v-if="loading" class="image-viewer__state" size="large" />
-    <a-result v-else-if="error" class="image-viewer__state" status="error" :sub-title="t('placeholder.imageError')" />
+    <a-result v-else-if="error" class="image-viewer__state" status="error" :sub-title="errorMessage" />
     <div v-else-if="!hasImage" class="image-viewer__placeholder">
       <div class="image-viewer__icon" aria-hidden="true">PIC</div>
       <h1 class="image-viewer__title">{{ t('placeholder.viewerTitle') }}</h1>

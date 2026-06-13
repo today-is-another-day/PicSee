@@ -1,6 +1,13 @@
 import { invoke } from '@tauri-apps/api/core'
+import { i18n } from '@/i18n'
 import { useImageStore } from '@/stores/image'
-import type { ImageEntry, ImageProbe, LargeImageSession, OpenLargeImageResult } from '@/types/image'
+import type {
+  ImageEntry,
+  ImageProbe,
+  LargeImageBackendError,
+  LargeImageSession,
+  OpenLargeImageResult,
+} from '@/types/image'
 
 /** 调用 token，每次 openImage 递增，用于取消旧的 in-flight 请求。 */
 let currentToken = 0
@@ -38,72 +45,119 @@ function reportE2E(data: Record<string, unknown>): void {
 export function useLargeImage() {
   const imageStore = useImageStore()
 
+  function closeSession(session: LargeImageSession | null): void {
+    if (!session) return
+    void invoke('close_large_image', { sessionId: session.sessionId }).catch(() => {})
+  }
+
+  function localizeError(reason: unknown): Error {
+    const backend = reason as Partial<LargeImageBackendError> | null
+    if (backend && typeof backend.code === 'string') {
+      const key = `largeImage.errors.${backend.code}`
+      const translated = i18n.global.t(key)
+      return new Error(translated === key ? backend.message ?? String(reason) : translated)
+    }
+    return reason instanceof Error ? reason : new Error(String(reason))
+  }
+
   /**
    * 打开图片（含 probe 分流）。
    * loadMode=normal → 走 <img>；largeCandidate/tileRequired → 走大图路径。
    */
   async function openImage(entry: ImageEntry): Promise<void> {
+    const oldSession = imageStore.largeImageSession
     // 1. 重置 UI 状态，显示 loading spinner
     imageStore.setCurrent(entry)
 
     // 2. 递增 token，取消旧 in-flight 请求
     const token = ++currentToken
-    const oldSession = imageStore.largeImageSession
-
-    // fire-and-forget 关闭旧会话（不阻塞新图加载）
-    if (oldSession) {
-      void invoke('close_large_image', { sessionId: oldSession.sessionId }).catch(() => {
-        // 忽略关闭错误（会话可能已超时）
-      })
-    }
-
+    let probe: ImageProbe
     try {
       // 3. Probe：只读文件头，极快（<50ms 普通图，<5ms BMP）
       const probeStart = performance.now()
-      const probe = await invoke<ImageProbe>('probe_image', { path: entry.path })
+      probe = await invoke<ImageProbe>('probe_image', { path: entry.path })
       const probeMs = (performance.now() - probeStart).toFixed(0)
-      console.log(
-        `[PicSee] probe_image: ${entry.name} → loadMode=${probe.loadMode}, `
-        + `${probe.width}×${probe.height}, ${probeMs}ms`,
-      )
+      if (import.meta.env.DEV) {
+        console.log(
+          `[PicSee] probe_image: ${entry.name} → loadMode=${probe.loadMode}, `
+          + `${probe.width}×${probe.height}, ${probeMs}ms`,
+        )
+      }
       reportE2E({ event: 'probe', probeMs, loadMode: probe.loadMode, width: probe.width, height: probe.height })
 
       // token 失效（用户已切换到其他图）→ 丢弃结果
-      if (token !== currentToken) return
+      if (token !== currentToken) {
+        closeSession(oldSession)
+        return
+      }
 
       if (probe.loadMode === 'normal') {
-        // 4a. 普通路径：让 <img> 加载（imageStore.setNormalMode 赋 src）
         imageStore.setNormalMode(entry)
-      }
-      else {
-        // 4b. 大图路径（largeCandidate 第一阶段也走大图，保守省内存）
-        const openStart = performance.now()
-        const result = await invoke<OpenLargeImageResult>('open_large_image', { path: entry.path })
-
-        if (token !== currentToken) {
-          // 已切图，关闭刚打开的会话
-          void invoke('close_large_image', { sessionId: result.sessionId }).catch(() => {})
-          return
-        }
-
-        const openMs = (performance.now() - openStart).toFixed(0)
-        const session: LargeImageSession = { ...result, path: entry.path }
-        imageStore.setLargeImageSession(probe.loadMode, session, result.width, result.height)
-
-        console.log(
-          `[PicSee] open_large_image: sessionId=${result.sessionId}, gen=${result.generation}, `
-          + `${result.width}×${result.height}, open_large_image 耗时=${openMs}ms`,
-        )
-        reportE2E({ event: 'open_large_image', openMs, sessionId: result.sessionId, generation: result.generation, width: result.width, height: result.height })
+        closeSession(oldSession)
+        return
       }
     }
     catch (err) {
-      if (token !== currentToken) return
+      if (token !== currentToken) {
+        closeSession(oldSession)
+        return
+      }
+      // SVG 等 image crate 无法探测的格式继续交给 WebView 普通 img 路径。
+      imageStore.setNormalMode(entry)
+      closeSession(oldSession)
+      if (import.meta.env.DEV) console.warn('[PicSee] probe_image failed; falling back to img:', err)
+      reportE2E({ event: 'probe_fallback', message: String(err) })
+      return
+    }
+
+    try {
+      const openStart = performance.now()
+      const result = await invoke<OpenLargeImageResult>('open_large_image', { path: entry.path })
+
+      if (token !== currentToken) {
+        closeSession(oldSession)
+        // 已切图，关闭刚打开的会话
+        void invoke('close_large_image', { sessionId: result.sessionId }).catch(() => {})
+        return
+      }
+
+      const openMs = (performance.now() - openStart).toFixed(0)
+      const session: LargeImageSession = { ...result, path: entry.path }
+      imageStore.setLargeImageSession(probe.loadMode, session, result.width, result.height)
+      closeSession(oldSession)
+
+      if (import.meta.env.DEV) {
+        console.log(
+          `[PicSee] open_large_image: sessionId=${result.sessionId}, `
+          + `${result.width}×${result.height}, open_large_image 耗时=${openMs}ms`,
+        )
+      }
+      reportE2E({ event: 'open_large_image', openMs, sessionId: result.sessionId, width: result.width, height: result.height })
+    }
+    catch (err) {
+      if (token !== currentToken) {
+        closeSession(oldSession)
+        return
+      }
+      if (probe.loadMode === 'largeCandidate') {
+        imageStore.setNormalMode(entry)
+        closeSession(oldSession)
+        if (import.meta.env.DEV) console.warn('[PicSee] open_large_image failed; falling back to img:', err)
+        reportE2E({ event: 'open_fallback', message: String(err) })
+        return
+      }
+      closeSession(oldSession)
       console.error('[PicSee] openImage failed:', err)
-      imageStore.markError(err)
+      imageStore.markError(localizeError(err))
       reportE2E({ event: 'error', message: String(err) })
     }
   }
 
-  return { openImage }
+  function closeCurrentLargeImage(): void {
+    currentToken++
+    closeSession(imageStore.largeImageSession)
+    imageStore.setCurrent(null)
+  }
+
+  return { closeCurrentLargeImage, openImage }
 }

@@ -84,7 +84,9 @@ export const useImageStore = defineStore('image', () => {
     naturalHeight.value = height
     loading.value = false
     error.value = null
-    useViewerStore().setImageSize(width, height)
+    const viewerStore = useViewerStore()
+    viewerStore.setImageSize(width, height)
+    if (viewerStore.displayMode !== 'custom') viewerStore.applyDisplayMode(viewerStore.displayMode)
   }
 
   return {

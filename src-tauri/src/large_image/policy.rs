@@ -28,6 +28,7 @@ pub struct ImageProbe {
     pub file_size: u64,
     pub is_large: bool,
     pub load_mode: LoadMode,
+    pub tileable: bool,
 }
 
 /// 判断图像是否为大图。
@@ -89,33 +90,6 @@ pub fn determine_load_mode(
     LoadMode::Normal
 }
 
-/// 探测 BMP 文件头，读取宽高（54 字节 BITMAPFILEHEADER + BITMAPINFOHEADER）。
-fn probe_bmp_dimensions(path: &Path) -> Result<(u32, u32), LargeImageError> {
-    use std::io::Read;
-
-    let mut file =
-        fs::File::open(path).map_err(|e| LargeImageError::io(format!("无法打开文件: {e}")))?;
-
-    let mut header = [0u8; 54];
-    file.read_exact(&mut header)
-        .map_err(|e| LargeImageError::decode(format!("读取 BMP 头失败: {e}")))?;
-
-    // 校验魔数 'BM'
-    if &header[0..2] != b"BM" {
-        return Err(LargeImageError::decode("不是有效的 BMP 文件（魔数错误）"));
-    }
-
-    // width @ offset 18，4 字节 LE i32
-    let width = i32::from_le_bytes(header[18..22].try_into().unwrap());
-    // height @ offset 22，4 字节 LE i32（负数表示 top-down）
-    let height = i32::from_le_bytes(header[22..26].try_into().unwrap());
-
-    let w = width.unsigned_abs();
-    let h = height.unsigned_abs();
-
-    Ok((w, h))
-}
-
 /// 探测图像文件，返回 ImageProbe。
 pub fn probe_image_file(
     path: &Path,
@@ -131,9 +105,9 @@ pub fn probe_image_file(
         .unwrap_or("")
         .to_lowercase();
 
-    let (width, height, format) = if ext == "bmp" {
-        let (w, h) = probe_bmp_dimensions(path)?;
-        (w, h, "bmp".to_string())
+    let (width, height, format, tileable) = if ext == "bmp" {
+        let info = super::bmp::BmpInfo::from_file(path)?;
+        (info.width, info.height, "bmp".to_string(), true)
     } else {
         let reader = image::ImageReader::open(path)
             .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
@@ -146,7 +120,7 @@ pub fn probe_image_file(
         let (w, h) = reader
             .into_dimensions()
             .map_err(|e| LargeImageError::decode(format!("读取图像尺寸失败: {e}")))?;
-        (w, h, fmt)
+        (w, h, fmt, false)
     };
 
     let is_large = is_large_image(width, height, file_size, &ext, settings);
@@ -159,6 +133,7 @@ pub fn probe_image_file(
         file_size,
         is_large,
         load_mode,
+        tileable,
     })
 }
 
@@ -181,14 +156,19 @@ pub async fn probe_image(app: AppHandle, path: String) -> Result<ImageProbe, Lar
 
     #[cfg(debug_assertions)]
     let probe_start = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || probe_image_file(Path::new(&path), &large_settings))
-        .await
-        .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))?;
+    let result =
+        tokio::task::spawn_blocking(move || probe_image_file(Path::new(&path), &large_settings))
+            .await
+            .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))?;
     #[cfg(debug_assertions)]
     if let Ok(ref probe) = result {
-        println!("[PicSee] probe_image: loadMode={:?} {}×{} 耗时={}ms",
-            probe.load_mode, probe.width, probe.height,
-            probe_start.elapsed().as_millis());
+        println!(
+            "[PicSee] probe_image: loadMode={:?} {}×{} 耗时={}ms",
+            probe.load_mode,
+            probe.width,
+            probe.height,
+            probe_start.elapsed().as_millis()
+        );
     }
     result
 }
@@ -315,9 +295,9 @@ mod tests {
         f.write_all(&header).unwrap();
         f.flush().unwrap();
 
-        let (w, h) = probe_bmp_dimensions(f.path()).unwrap();
-        assert_eq!(w, 100);
-        assert_eq!(h, 80);
+        let info = super::super::bmp::BmpInfo::from_file(f.path()).unwrap();
+        assert_eq!(info.width, 100);
+        assert_eq!(info.height, 80);
     }
 
     #[test]
@@ -328,9 +308,9 @@ mod tests {
         f.write_all(&header).unwrap();
         f.flush().unwrap();
 
-        let (w, h) = probe_bmp_dimensions(f.path()).unwrap();
-        assert_eq!(w, 200);
-        assert_eq!(h, 150);
+        let info = super::super::bmp::BmpInfo::from_file(f.path()).unwrap();
+        assert_eq!(info.width, 200);
+        assert_eq!(info.height, 150);
     }
 
     #[test]
@@ -341,7 +321,7 @@ mod tests {
         f.write_all(&header).unwrap();
         f.flush().unwrap();
 
-        let result = probe_bmp_dimensions(f.path());
+        let result = super::super::bmp::BmpInfo::from_file(f.path());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, "DECODE_ERROR");
     }

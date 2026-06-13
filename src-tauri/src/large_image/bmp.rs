@@ -6,6 +6,13 @@ use std::{
 
 use super::LargeImageError;
 
+/// 防止病态 BMP 头触发过量分配或算术边界问题。
+const MAX_BMP_DIMENSION: u32 = 200_000;
+
+fn nearest_source_index(target_index: u32, source_size: u32, target_size: u32) -> u32 {
+    ((target_index as u64 * source_size as u64) / target_size as u64) as u32
+}
+
 /// BMP 像素格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -84,6 +91,11 @@ impl BmpInfo {
         let width = width_raw.unsigned_abs();
         let bottom_up = height_raw >= 0;
         let height = height_raw.unsigned_abs();
+        if width == 0 || height == 0 || width > MAX_BMP_DIMENSION || height > MAX_BMP_DIMENSION {
+            return Err(LargeImageError::decode(format!(
+                "BMP 尺寸 {width}×{height} 超出支持范围"
+            )));
+        }
 
         // bit count（offset 28）
         let bit_count = u16::from_le_bytes(header[28..30].try_into().unwrap());
@@ -187,7 +199,7 @@ impl BmpReader {
 
         for ty in 0..target_height {
             // nearest neighbor：目标行 ty → 源行 src_row
-            let src_row = src_y + (ty * src_h) / target_height;
+            let src_row = src_y + nearest_source_index(ty, src_h, target_height);
             let row_offset = self.info.row_file_offset(src_row);
             let col_offset = src_x as u64 * bpp as u64;
             let row_bytes_needed = src_w as usize * bpp;
@@ -203,7 +215,7 @@ impl BmpReader {
 
             for tx in 0..target_width {
                 // nearest neighbor：目标列 tx → 源列 src_col
-                let src_col = (tx * src_w) / target_width;
+                let src_col = nearest_source_index(tx, src_w, target_width);
                 let src_off = src_col as usize * bpp;
 
                 let out_off = (ty as usize * target_width as usize + tx as usize) * 4;
@@ -545,5 +557,21 @@ mod tests {
         let result = BmpInfo::from_file(f.path());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, "UNSUPPORTED_FORMAT");
+    }
+
+    #[test]
+    fn test_rejects_pathological_dimensions() {
+        let mut raw = make_bmp_raw(4, 4, true, false);
+        raw[18..22].copy_from_slice(&((MAX_BMP_DIMENSION + 1) as i32).to_le_bytes());
+        let result = BmpInfo::from_reader(&mut std::io::Cursor::new(raw));
+        assert_eq!(result.unwrap_err().code, "DECODE_ERROR");
+    }
+
+    #[test]
+    fn test_nearest_source_index_uses_u64_math() {
+        assert_eq!(
+            nearest_source_index(u32::MAX - 1, u32::MAX, u32::MAX),
+            u32::MAX - 1
+        );
     }
 }

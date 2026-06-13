@@ -64,12 +64,7 @@ onMounted(() => {
       const tryOpen = (attempt = 0) => {
         const w = window as unknown as { __picseeDebugOpen?: (p: string) => Promise<void> }
         if (w.__picseeDebugOpen) {
-          void (async () => {
-            await w.__picseeDebugOpen!(autoPath)
-            // 放大到 actual-size（zoom=1 > previewScale）以触发 tile 加载路径
-            const { useViewerStore } = await import('@/stores/viewer')
-            setTimeout(() => useViewerStore().applyDisplayMode('actual-size'), 800)
-          })()
+          void w.__picseeDebugOpen(autoPath)
         }
         else if (attempt < 40) {
           setTimeout(() => tryOpen(attempt + 1), 100)

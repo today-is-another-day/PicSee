@@ -26,12 +26,13 @@ type TileKey = (u64, u32, u32, u32);
 #[derive(Debug)]
 pub struct ImageSession {
     pub session_id: u64,
-    pub generation: u64,
     pub path: std::path::PathBuf,
     pub width: u32,
     pub height: u32,
     pub tile_size: u32,
     pub preview_max_size: u32,
+    /// 是否支持原始分辨率瓦片读取；M4 仅支持 24/32-bit BI_RGB BMP。
+    pub tileable: bool,
     /// 预览图 WebP 字节。
     pub preview_webp: Vec<u8>,
 }
@@ -40,8 +41,8 @@ pub struct ImageSession {
 pub struct LargeImageState {
     /// 最多保留 2 个会话（超出时逐出最旧的）。
     sessions: VecDeque<Arc<ImageSession>>,
-    /// 自增生成号，用于防止 stale 请求。
-    next_generation: u64,
+    /// 自增会话 ID。
+    next_session_id: u64,
     /// 瓦片 LRU 缓存。
     tile_cache: LruCache<TileKey, Vec<u8>>,
     /// 当前瓦片缓存占用字节数。
@@ -61,7 +62,7 @@ impl LargeImageState {
         let tile_cache_limit_bytes = memory_limit_mb * 1024 * 1024 * 40 / 100;
         Self {
             sessions: VecDeque::new(),
-            next_generation: 1,
+            next_session_id: 1,
             tile_cache: LruCache::new(NonZeroUsize::new(4096).unwrap()),
             tile_cache_bytes: 0,
             tile_cache_limit_bytes,
@@ -77,23 +78,12 @@ impl LargeImageState {
             .cloned()
     }
 
-    /// 查找会话并验证 generation（防止 stale 请求）。
-    pub fn find_session_with_generation(
-        &self,
-        session_id: u64,
-        generation: u64,
-    ) -> Result<Arc<ImageSession>, LargeImageError> {
-        match self.find_session(session_id) {
-            None => Err(LargeImageError::session_not_found(session_id)),
-            Some(s) if s.generation != generation => Err(LargeImageError::stale_generation()),
-            Some(s) => Ok(s),
-        }
-    }
-
     /// 添加会话；超过 2 个时逐出最旧的。
     pub fn add_session(&mut self, session: Arc<ImageSession>) {
         while self.sessions.len() >= 2 {
-            self.sessions.pop_front();
+            if let Some(evicted) = self.sessions.pop_front() {
+                self.clear_session_tiles(evicted.session_id);
+            }
         }
         self.sessions.push_back(session);
     }
@@ -101,13 +91,28 @@ impl LargeImageState {
     /// 移除指定 session_id 的会话。
     pub fn remove_session(&mut self, session_id: u64) {
         self.sessions.retain(|s| s.session_id != session_id);
+        self.clear_session_tiles(session_id);
     }
 
-    /// 生成并消费下一个 generation。
-    pub fn next_generation(&mut self) -> u64 {
-        let gen = self.next_generation;
-        self.next_generation += 1;
-        gen
+    /// 生成并消费下一个会话 ID。
+    pub fn next_session_id(&mut self) -> u64 {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        id
+    }
+
+    /// 清理指定会话的全部瓦片缓存并校正字节计数。
+    fn clear_session_tiles(&mut self, session_id: u64) {
+        let keys: Vec<TileKey> = self
+            .tile_cache
+            .iter()
+            .filter_map(|(key, _)| (key.0 == session_id).then_some(*key))
+            .collect();
+        for key in keys {
+            if let Some(data) = self.tile_cache.pop(&key) {
+                self.tile_cache_bytes = self.tile_cache_bytes.saturating_sub(data.len());
+            }
+        }
     }
 
     /// 从 LRU 缓存中查找瓦片。
@@ -142,11 +147,11 @@ impl LargeImageState {
 #[serde(rename_all = "camelCase")]
 pub struct OpenLargeImageResult {
     pub session_id: u64,
-    pub generation: u64,
     pub width: u32,
     pub height: u32,
     pub tile_size: u32,
     pub preview_max_size: u32,
+    pub tileable: bool,
 }
 
 /// 等比缩放，最长边 ≤ max。
@@ -242,42 +247,32 @@ pub fn generate_generic_preview(path: &Path, preview_max: u32) -> Result<Vec<u8>
     let (pw, ph) = scale_to_fit_correct(w, h, preview_max);
 
     let thumb = img.thumbnail(pw, ph);
+    // M4 非 BMP preview 仍需一次整图解码；缩略后立即释放原始缓冲，M6 改为增量解码。
+    drop(img);
     let rgba = thumb.to_rgba8();
     encode_rgba_to_webp(rgba.as_raw(), thumb.width(), thumb.height(), 80.0)
 }
 
 // ─────────────────────────── 协议处理器 ───────────────────────────
 
-/// 将会话查找错误映射为 HTTP 状态码。
-/// - STALE_GENERATION（generation 过期）→ 410 Gone
-/// - SESSION_NOT_FOUND（会话不存在）→ 404 Not Found
-fn session_error_status(err: &LargeImageError) -> u16 {
-    match err.code {
-        "STALE_GENERATION" => 410,
-        _ => 404,
-    }
-}
-
-/// 处理 picsee://localhost/preview/{session_id}/{generation} 请求。
+/// 处理 picsee://localhost/preview/{session_id} 请求。
 pub fn handle_preview_request(
     state: &Mutex<LargeImageState>,
     session_id: u64,
-    generation: u64,
 ) -> Result<Vec<u8>, (u16, LargeImageError)> {
     let guard = state.lock().unwrap();
     let session = guard
-        .find_session_with_generation(session_id, generation)
-        .map_err(|e| (session_error_status(&e), e))?;
+        .find_session(session_id)
+        .ok_or_else(|| (404, LargeImageError::session_not_found(session_id)))?;
     Ok(session.preview_webp.clone())
 }
 
-/// 处理 picsee://localhost/tile/{session_id}/{generation}/{z}/{tx}/{ty} 请求。
+/// 处理 picsee://localhost/tile/{session_id}/{z}/{tx}/{ty} 请求。
 ///
 /// 先查 LRU 缓存，命中则直接返回；未命中则在锁外解码，写回缓存。
 pub fn handle_tile_request(
     state_arc: Arc<Mutex<LargeImageState>>,
     session_id: u64,
-    generation: u64,
     _z: u32,
     tile_x: u32,
     tile_y: u32,
@@ -296,8 +291,11 @@ pub fn handle_tile_request(
     let (path, tile_size, img_w, img_h) = {
         let guard = state_arc.lock().unwrap();
         let session = guard
-            .find_session_with_generation(session_id, generation)
-            .map_err(|e| (session_error_status(&e), e))?;
+            .find_session(session_id)
+            .ok_or_else(|| (404, LargeImageError::session_not_found(session_id)))?;
+        if !session.tileable {
+            return Err((415, LargeImageError::tiles_unavailable()));
+        }
         (
             session.path.clone(),
             session.tile_size,
@@ -320,7 +318,9 @@ pub fn handle_tile_request(
     // 写回缓存
     {
         let mut guard = state_arc.lock().unwrap();
-        guard.put_tile_cached(tile_key, webp.clone());
+        if guard.find_session(session_id).is_some() {
+            guard.put_tile_cached(tile_key, webp.clone());
+        }
     }
 
     Ok(webp)
@@ -358,19 +358,20 @@ pub async fn open_large_image(
     let path_clone = path_buf.clone();
     #[cfg(debug_assertions)]
     let open_start = std::time::Instant::now();
-    let (width, height, preview_webp) = tokio::task::spawn_blocking(move || {
-        let (w, h) = if ext == "bmp" {
+    let (width, height, preview_webp, tileable) = tokio::task::spawn_blocking(move || {
+        let (w, h, tileable) = if ext == "bmp" {
             use crate::large_image::bmp::BmpInfo;
             let info = BmpInfo::from_file(&path_clone)?;
-            (info.width, info.height)
+            (info.width, info.height, true)
         } else {
             let reader = image::ImageReader::open(&path_clone)
                 .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
                 .with_guessed_format()
                 .map_err(|e| LargeImageError::io(format!("猜测格式失败: {e}")))?;
-            reader
+            let (w, h) = reader
                 .into_dimensions()
-                .map_err(|e| LargeImageError::decode(format!("读取尺寸失败: {e}")))?
+                .map_err(|e| LargeImageError::decode(format!("读取尺寸失败: {e}")))?;
+            (w, h, false)
         };
 
         let preview = if ext == "bmp" {
@@ -379,36 +380,40 @@ pub async fn open_large_image(
             generate_generic_preview(&path_clone, preview_max_size)?
         };
 
-        Ok::<_, LargeImageError>((w, h, preview))
+        Ok::<_, LargeImageError>((w, h, preview, tileable))
     })
     .await
     .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))??;
 
     #[cfg(debug_assertions)]
-    println!("[PicSee] open_large_image: {}×{}, preview_gen耗时={}ms",
-        width, height, open_start.elapsed().as_millis());
+    println!(
+        "[PicSee] open_large_image: {}×{}, preview_gen耗时={}ms",
+        width,
+        height,
+        open_start.elapsed().as_millis()
+    );
 
     // 注册到 managed state
     let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
     let mut guard = state_arc.lock().unwrap();
-    let generation = guard.next_generation();
+    let session_id = guard.next_session_id();
     let session = Arc::new(ImageSession {
-        session_id: generation,
-        generation,
+        session_id,
         path: path_buf,
         width,
         height,
         tile_size,
         preview_max_size,
+        tileable,
         preview_webp,
     });
     let result = OpenLargeImageResult {
         session_id: session.session_id,
-        generation: session.generation,
         width,
         height,
         tile_size,
         preview_max_size,
+        tileable,
     };
     guard.add_session(session);
 
@@ -458,7 +463,7 @@ mod tests {
         assert_eq!(scale_to_fit_correct(8192, 8192, 4096), (4096, 4096));
     }
 
-    // ── session generation ──
+    // ── session lifecycle ──
 
     fn make_state() -> LargeImageState {
         LargeImageState::new(4, 512)
@@ -467,39 +472,27 @@ mod tests {
     fn make_session(id: u64) -> Arc<ImageSession> {
         Arc::new(ImageSession {
             session_id: id,
-            generation: id,
             path: std::path::PathBuf::from("/tmp/test.bmp"),
             width: 1000,
             height: 1000,
             tile_size: 512,
             preview_max_size: 4096,
+            tileable: true,
             preview_webp: vec![],
         })
     }
 
     #[test]
-    fn test_session_generation_accepted() {
+    fn test_session_lookup() {
         let mut state = make_state();
         state.add_session(make_session(1));
-        let result = state.find_session_with_generation(1, 1);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_session_generation_stale_rejected() {
-        let mut state = make_state();
-        state.add_session(make_session(1));
-        let result = state.find_session_with_generation(1, 99);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "STALE_GENERATION");
+        assert!(state.find_session(1).is_some());
     }
 
     #[test]
     fn test_session_not_found() {
         let state = make_state();
-        let result = state.find_session_with_generation(999, 999);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "SESSION_NOT_FOUND");
+        assert!(state.find_session(999).is_none());
     }
 
     #[test]
@@ -512,6 +505,56 @@ mod tests {
         assert!(state.find_session(1).is_none());
         assert!(state.find_session(2).is_some());
         assert!(state.find_session(3).is_some());
+    }
+
+    #[test]
+    fn test_session_remove_clears_tile_cache() {
+        let mut state = make_state();
+        state.add_session(make_session(1));
+        state.add_session(make_session(2));
+        state.put_tile_cached((1, 0, 0, 0), vec![1, 2, 3]);
+        state.put_tile_cached((2, 0, 0, 0), vec![4, 5]);
+
+        state.remove_session(1);
+
+        assert!(state.get_tile_cached((1, 0, 0, 0)).is_none());
+        assert_eq!(state.get_tile_cached((2, 0, 0, 0)), Some(vec![4, 5]));
+        assert_eq!(state.tile_cache_bytes, 2);
+    }
+
+    #[test]
+    fn test_session_eviction_clears_tile_cache() {
+        let mut state = make_state();
+        state.add_session(make_session(1));
+        state.put_tile_cached((1, 0, 0, 0), vec![1, 2, 3]);
+        state.add_session(make_session(2));
+        state.add_session(make_session(3));
+
+        assert!(state.get_tile_cached((1, 0, 0, 0)).is_none());
+        assert_eq!(state.tile_cache_bytes, 0);
+    }
+
+    #[test]
+    fn test_non_tileable_session_returns_explicit_error() {
+        let state = Arc::new(Mutex::new(make_state()));
+        let mut session = make_session(1);
+        Arc::get_mut(&mut session).unwrap().tileable = false;
+        state.lock().unwrap().add_session(session);
+
+        let result = handle_tile_request(state, 1, 0, 0, 0);
+        let (status, error) = result.unwrap_err();
+        assert_eq!(status, 415);
+        assert_eq!(error.code, "TILES_UNAVAILABLE");
+    }
+
+    #[test]
+    fn test_tileable_session_reaches_decoder() {
+        let state = Arc::new(Mutex::new(make_state()));
+        state.lock().unwrap().add_session(make_session(1));
+
+        let result = handle_tile_request(state, 1, 0, 0, 0);
+        let (_, error) = result.unwrap_err();
+        assert_eq!(error.code, "IO_ERROR");
     }
 
     // ── tile cache ──
@@ -635,5 +678,35 @@ mod tests {
         let tile = generate_bmp_tile(f.path(), 0, 0, 512, width, height).unwrap();
         assert!(!tile.is_empty());
         println!("Tile (0,0) 大小: {}KB", tile.len() / 1024);
+    }
+
+    #[test]
+    #[ignore]
+    fn integration_workspace_large_bmp_preview_tile() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-assets/test-large.bmp");
+        assert!(path.exists(), "缺少集成测试文件: {}", path.display());
+
+        let reader = BmpReader::open(&path).unwrap();
+        let preview_start = std::time::Instant::now();
+        let preview = generate_bmp_preview(&path, 4096).unwrap();
+        let preview_ms = preview_start.elapsed().as_millis();
+
+        let tile_start = std::time::Instant::now();
+        let tile =
+            generate_bmp_tile(&path, 0, 0, 512, reader.info.width, reader.info.height).unwrap();
+        let tile_ms = tile_start.elapsed().as_millis();
+
+        assert_eq!(&preview[0..4], b"RIFF");
+        assert_eq!(&tile[0..4], b"RIFF");
+        println!(
+            "Workspace BMP {}×{}: preview={}KB/{}ms, tile={}KB/{}ms",
+            reader.info.width,
+            reader.info.height,
+            preview.len() / 1024,
+            preview_ms,
+            tile.len() / 1024,
+            tile_ms
+        );
     }
 }

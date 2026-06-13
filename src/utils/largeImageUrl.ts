@@ -23,17 +23,17 @@ function picseeBase(): string {
 
 /**
  * 拼接 preview URL。
- * 格式：{base}/preview/{sessionId}/{generation}
+ * 格式：{base}/preview/{sessionId}
  */
-export function previewUrl(sessionId: number, generation: number): string {
-  return `${picseeBase()}/preview/${sessionId}/${generation}`
+export function previewUrl(sessionId: number): string {
+  return `${picseeBase()}/preview/${sessionId}`
 }
 
 /**
  * 拼接 tile URL。
- * 格式：{base}/tile/{sessionId}/{generation}/0/{x}/{y}
+ * 格式：{base}/tile/{sessionId}/0/{x}/{y}
  * z 固定为 0（原始分辨率；多级 LOD 在后续里程碑实现）。
  */
-export function tileUrl(sessionId: number, generation: number, x: number, y: number): string {
-  return `${picseeBase()}/tile/${sessionId}/${generation}/0/${x}/${y}`
+export function tileUrl(sessionId: number, x: number, y: number): string {
+  return `${picseeBase()}/tile/${sessionId}/0/${x}/${y}`
 }

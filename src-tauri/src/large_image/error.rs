@@ -16,13 +16,6 @@ impl LargeImageError {
         }
     }
 
-    pub fn stale_generation() -> Self {
-        Self::new(
-            "STALE_GENERATION",
-            "Session generation mismatch; request is stale",
-        )
-    }
-
     pub fn session_not_found(session_id: u64) -> Self {
         Self::new(
             "SESSION_NOT_FOUND",
@@ -34,6 +27,13 @@ impl LargeImageError {
         Self::new(
             "TILE_OUT_OF_RANGE",
             format!("Tile ({x}, {y}) is out of image range"),
+        )
+    }
+
+    pub fn tiles_unavailable() -> Self {
+        Self::new(
+            "TILES_UNAVAILABLE",
+            "This image format only supports preview rendering",
         )
     }
 

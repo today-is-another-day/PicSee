@@ -6,6 +6,8 @@
 
 **Architecture:** 新建 `src-tauri/src/large_image/` 子模块，包含 policy（判定）、bmp（自研读取器）、session（会话管理 + LRU tile 缓存 + preview 生成）三个文件，由 `mod.rs` 统一导出；在 `lib.rs` 注册 `picsee://` 自定义协议和三个 command；错误码复用 `{code, message}` 结构，抽公共 `error.rs`。preview/tile 全部走 WebP 编码，通过 picsee:// 协议直接被前端 `<img>` 消费，零 JSON 传像素。
 
+**M4 已知内存风险：** 非 BMP 大图生成 preview 时仍会由 `image` crate 一次性解码整图；缩放完成后立即释放原始解码缓冲，仅在会话中保留 preview WebP。M6 需改用增量/分块解码以消除峰值内存风险。非 BMP 在 M4 为 preview-only，不请求 tile。
+
 **Tech Stack:** Rust, Tauri 2.0, `image` crate (已有 webp feature), `tokio` (已有), `uuid` crate (新增), `lru` crate (新增), `webp` crate (或 image crate 内置 WebP 编码)
 
 ---

@@ -12,7 +12,6 @@ import ThumbnailSidebar from './ThumbnailSidebar.vue'
 import TopToolbar from './TopToolbar.vue'
 import { useAppStore } from '@/stores/app'
 import { useDirectoryStore } from '@/stores/directory'
-import { useImageStore } from '@/stores/image'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import { convertFileSrc } from '@tauri-apps/api/core'
@@ -21,13 +20,12 @@ import { useLargeImage } from '@/composables/useLargeImage'
 const appStore = useAppStore()
 const { t } = useI18n()
 const directoryStore = useDirectoryStore()
-const imageStore = useImageStore()
 const settingsStore = useSettingsStore()
 const viewerStore = useViewerStore()
 const { currentEntry } = storeToRefs(directoryStore)
 const { error: directoryError } = storeToRefs(directoryStore)
 const { settings } = storeToRefs(settingsStore)
-const { openImage } = useLargeImage()
+const { closeCurrentLargeImage, openImage } = useLargeImage()
 
 const layoutClasses = computed(() => ({
   'app-layout--compact': settings.value.layout.compactMode,
@@ -53,7 +51,7 @@ watch(() => currentEntry.value?.path, (path, previousPath) => {
     void openImage(currentEntry.value)
   }
   else {
-    imageStore.setCurrent(null)
+    closeCurrentLargeImage()
   }
 }, { immediate: true })
 

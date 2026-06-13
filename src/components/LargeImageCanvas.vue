@@ -48,13 +48,17 @@ const previewLoaded = shallowRef(false)
 const TILE_CACHE_LIMIT = 256
 
 /**
- * tile 缓存：key = `${sessionId}:${gen}:${x}:${y}` → HTMLImageElement。
+ * tile 缓存：key = `${sessionId}:${x}:${y}` → HTMLImageElement。
  * 使用 insertion-order Map 模拟 LRU（每次访问时 delete+set 移到末尾）。
  */
 const tileCache = new Map<string, HTMLImageElement>()
 
 /** 正在加载的 tile key 集合，防止重复发起请求。 */
 const loadingTiles = new Set<string>()
+/** 加载失败的 tile 负缓存，避免每帧重复请求。 */
+const failedTiles = new Set<string>()
+/** 跟踪在途 Image，卸载或切会话时解除回调。 */
+const inflightImages = new Set<HTMLImageElement>()
 
 // ─── rAF 状态 ─────────────────────────────────────────────────────
 let rafHandle: number | null = null
@@ -134,31 +138,38 @@ function lruAccess(key: string, img: HTMLImageElement) {
  * - 其他 → 发起 new Image() 请求
  */
 function loadTile(tx: number, ty: number) {
-  const { sessionId, generation } = props.session
-  const key = `${sessionId}:${generation}:${tx}:${ty}`
+  const { sessionId } = props.session
+  const key = `${sessionId}:${tx}:${ty}`
 
-  if (tileCache.has(key) || loadingTiles.has(key)) return
+  if (tileCache.has(key) || loadingTiles.has(key) || failedTiles.has(key)) return
 
   loadingTiles.add(key)
   const img = new Image()
-  img.src = tileUrl(sessionId, generation, tx, ty)
+  inflightImages.add(img)
+  img.src = tileUrl(sessionId, tx, ty)
 
   img.onload = () => {
     loadingTiles.delete(key)
-    // generation 校验：onload 时确认 session 仍是当前
-    if (props.session.sessionId !== sessionId || props.session.generation !== generation) {
-      return // 旧会话的 tile，丢弃
-    }
+    inflightImages.delete(img)
+    if (props.session.sessionId !== sessionId) return
     lruAccess(key, img)
     scheduleRender()
   }
 
   img.onerror = () => {
     loadingTiles.delete(key)
-    // 410=generation 过期（静默忽略），404/其它 console.warn
-    // img.onerror 在 picsee:// 下无法直接拿到 HTTP status，统一 warn
+    inflightImages.delete(img)
+    failedTiles.add(key)
     console.warn(`[PicSee] tile load error: ${key}`)
   }
+}
+
+function cancelInflightImages() {
+  for (const img of inflightImages) {
+    img.onload = null
+    img.onerror = null
+  }
+  inflightImages.clear()
 }
 
 /** 请求 rAF 重绘（合批：同一帧内多次调用只触发一次）。 */
@@ -210,33 +221,37 @@ function render() {
   const { tx0, ty0, tx1, ty1 } = computeVisibleTileRange(
     visRect.imgX, visRect.imgY, visRect.imgX1, visRect.imgY1,
   )
+  const visibleTileCount = Math.max(0, tx1 - tx0 + 1) * Math.max(0, ty1 - ty0 + 1)
+  const previewScale = computePreviewScale()
+  const needTiles = props.session.tileable
+    && zoom.value * dpr > previewScale
+    // TODO M6：引入 z 级 LOD 后移除此低倍率保护。
+    && visibleTileCount <= Math.floor(TILE_CACHE_LIMIT * 0.7)
 
-  for (let ty = ty0; ty <= ty1; ty++) {
-    for (let tx = tx0; tx <= tx1; tx++) {
-      const { sessionId, generation } = props.session
-      const key = `${sessionId}:${generation}:${tx}:${ty}`
-      const cached = tileCache.get(key)
-      if (!cached) continue
+  if (needTiles) {
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const { sessionId } = props.session
+        const key = `${sessionId}:${tx}:${ty}`
+        const cached = tileCache.get(key)
+        if (!cached) continue
 
-      // tile 在图像坐标系中的像素位置
-      const tileX = tx * tileSize
-      const tileY = ty * tileSize
-      const tileW = Math.min(tileSize, imgW - tileX)
-      const tileH = Math.min(tileSize, imgH - tileY)
+        // tile 在图像坐标系中的像素位置
+        const tileX = tx * tileSize
+        const tileY = ty * tileSize
+        const tileW = Math.min(tileSize, imgW - tileX)
+        const tileH = Math.min(tileSize, imgH - tileY)
 
-      // 转换到 canvas 物理像素坐标
-      const canvasX = (tileX * z + ox) * dpr
-      const canvasY = (tileY * z + oy) * dpr
-      const canvasW = tileW * z * dpr
-      const canvasH = tileH * z * dpr
+        // 转换到 canvas 物理像素坐标
+        const canvasX = (tileX * z + ox) * dpr
+        const canvasY = (tileY * z + oy) * dpr
+        const canvasW = tileW * z * dpr
+        const canvasH = tileH * z * dpr
 
-      ctx.drawImage(cached, canvasX, canvasY, canvasW, canvasH)
+        ctx.drawImage(cached, canvasX, canvasY, canvasW, canvasH)
+      }
     }
   }
-
-  // ── tile 按需加载（仅在 zoom 超过 previewScale 时加载 tile）────────
-  const previewScale = computePreviewScale()
-  const needTiles = zoom.value > previewScale
 
   if (needTiles) {
     let firstScreenTileCount = 0
@@ -249,7 +264,7 @@ function render() {
     if (firstScreenTileCount > 0 && !firstTileReported) {
       firstTileReported = true
       const tileMsg = `首屏 tile 数: ${firstScreenTileCount} (tx0=${tx0},ty0=${ty0},tx1=${tx1},ty1=${ty1})`
-      console.log(`[PicSee] ${tileMsg}`)
+      if (import.meta.env.DEV) console.log(`[PicSee] ${tileMsg}`)
       // TODO M4-debug：上报首屏 tile 数
       if (import.meta.env.DEV) {
         void fetch('/__picsee_e2e_result', {
@@ -281,19 +296,22 @@ function render() {
 // ─── Preview 加载 ─────────────────────────────────────────────────
 
 function loadPreview() {
-  const { sessionId, generation } = props.session
-  const url = previewUrl(sessionId, generation)
+  const { sessionId } = props.session
+  const url = previewUrl(sessionId)
   const img = new Image()
+  inflightImages.add(img)
   img.src = url
   img.onload = () => {
-    if (props.session.sessionId !== sessionId || props.session.generation !== generation) return
+    inflightImages.delete(img)
+    if (props.session.sessionId !== sessionId) return
     previewImg.value = img
     previewLoaded.value = true
     scheduleRender()
-    console.log(`[PicSee] preview loaded: session=${sessionId}, gen=${generation}`)
+    if (import.meta.env.DEV) console.log(`[PicSee] preview loaded: session=${sessionId}`)
   }
   img.onerror = () => {
-    console.warn(`[PicSee] preview load error: session=${sessionId}, gen=${generation}`)
+    inflightImages.delete(img)
+    console.warn(`[PicSee] preview load error: session=${sessionId}`)
   }
 }
 
@@ -306,11 +324,13 @@ watch([zoom, offset, viewport], () => {
 
 // session 变化时重新加载 preview，清空 tile 缓存
 watch(() => props.session, (newSession, oldSession) => {
-  if (newSession.sessionId !== oldSession?.sessionId || newSession.generation !== oldSession?.generation) {
+  if (newSession.sessionId !== oldSession?.sessionId) {
+    cancelInflightImages()
     previewLoaded.value = false
     previewImg.value = null
     tileCache.clear()
     loadingTiles.clear()
+    failedTiles.clear()
     firstTileReported = false
     loadPreview()
     scheduleRender()
@@ -337,6 +357,8 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect()
   tileCache.clear()
   loadingTiles.clear()
+  failedTiles.clear()
+  cancelInflightImages()
 })
 </script>
 

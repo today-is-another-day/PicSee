@@ -22,6 +22,17 @@ export default {
     errorNotAllowed: '路径未经授权',
     errorIo: '读写缩略图时出错',
   },
+  largeImage: {
+    errors: {
+      SESSION_NOT_FOUND: '大图会话已失效',
+      TILE_OUT_OF_RANGE: '请求的图片分块超出范围',
+      TILES_UNAVAILABLE: '此图片格式仅支持预览显示',
+      UNSUPPORTED_FORMAT: '不支持此大图格式',
+      IO_ERROR: '读取大图时发生错误',
+      DECODE_ERROR: '大图解码失败',
+      ENCODE_ERROR: '大图预览编码失败',
+    },
+  },
   settings: {
     title: '设置',
     saved: '设置已保存',

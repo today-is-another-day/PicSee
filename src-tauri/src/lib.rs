@@ -36,13 +36,40 @@ fn parse_u64(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
+fn image_response(data: Vec<u8>, cache_control: &str) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(200)
+        .header("Content-Type", "image/webp")
+        .header("Cache-Control", cache_control)
+        .body(data)
+        .unwrap()
+}
+
+fn error_response(
+    status: u16,
+    err: large_image::LargeImageError,
+) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_vec(&err).unwrap_or_default())
+        .unwrap()
+}
+
+fn not_found_response() -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(404)
+        .body(b"Not found".to_vec())
+        .unwrap()
+}
+
 /// Build and run the PicSee Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .register_uri_scheme_protocol("picsee", {
-            move |ctx, request| {
+        .register_asynchronous_uri_scheme_protocol("picsee", {
+            move |ctx, request, responder| {
                 let url = request.uri().to_string();
                 let path = extract_picsee_path(&url);
                 let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -53,71 +80,63 @@ pub fn run() {
                     .inner()
                     .clone();
 
-                // /preview/{session_id}/{generation}
-                if segments.first() == Some(&"preview") && segments.len() >= 3 {
-                    if let (Some(session_id), Some(generation)) =
-                        (parse_u64(segments[1]), parse_u64(segments[2]))
-                    {
-                        match large_image::session::handle_preview_request(
-                            &state_arc, session_id, generation,
+                // /preview/{session_id}
+                if segments.first() == Some(&"preview") && segments.len() == 2 {
+                    if let Some(session_id) = parse_u64(segments[1]) {
+                        let response = match large_image::session::handle_preview_request(
+                            &state_arc, session_id,
                         ) {
-                            Ok(data) => {
-                                return tauri::http::Response::builder()
-                                    .status(200)
-                                    .header("Content-Type", "image/webp")
-                                    .header("Cache-Control", "no-store")
-                                    .body(data)
-                                    .unwrap();
-                            }
-                            Err((status, err)) => {
-                                let body = serde_json::to_vec(&err).unwrap_or_default();
-                                return tauri::http::Response::builder()
-                                    .status(status)
-                                    .header("Content-Type", "application/json")
-                                    .body(body)
-                                    .unwrap();
-                            }
-                        }
+                            Ok(data) => image_response(data, "no-store"),
+                            Err((status, err)) => error_response(status, err),
+                        };
+                        responder.respond(response);
+                        return;
                     }
                 }
 
-                // /tile/{session_id}/{generation}/{z}/{tx}/{ty}
-                if segments.first() == Some(&"tile") && segments.len() >= 6 {
-                    if let (Some(session_id), Some(generation), Some(z), Some(tx), Some(ty)) = (
+                // /tile/{session_id}/{z}/{tx}/{ty}
+                if segments.first() == Some(&"tile") && segments.len() == 5 {
+                    if let (Some(session_id), Some(z), Some(tx), Some(ty)) = (
                         parse_u64(segments[1]),
-                        parse_u64(segments[2]),
+                        parse_u32(segments[2]),
                         parse_u32(segments[3]),
                         parse_u32(segments[4]),
-                        parse_u32(segments[5]),
                     ) {
-                        match large_image::session::handle_tile_request(
-                            state_arc, session_id, generation, z, tx, ty,
-                        ) {
-                            Ok(data) => {
-                                return tauri::http::Response::builder()
-                                    .status(200)
-                                    .header("Content-Type", "image/webp")
-                                    .header("Cache-Control", "max-age=3600")
-                                    .body(data)
-                                    .unwrap();
-                            }
-                            Err((status, err)) => {
-                                let body = serde_json::to_vec(&err).unwrap_or_default();
-                                return tauri::http::Response::builder()
-                                    .status(status)
-                                    .header("Content-Type", "application/json")
-                                    .body(body)
-                                    .unwrap();
-                            }
-                        }
+                        let semaphore = state_arc.lock().unwrap().semaphore.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let response = match semaphore.acquire_owned().await {
+                                Ok(_permit) => {
+                                    match tauri::async_runtime::spawn_blocking(move || {
+                                        large_image::session::handle_tile_request(
+                                            state_arc, session_id, z, tx, ty,
+                                        )
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(data)) => image_response(data, "max-age=3600"),
+                                        Ok(Err((status, err))) => error_response(status, err),
+                                        Err(err) => error_response(
+                                            500,
+                                            large_image::LargeImageError::io(format!(
+                                                "tile task failed: {err}"
+                                            )),
+                                        ),
+                                    }
+                                }
+                                Err(err) => error_response(
+                                    500,
+                                    large_image::LargeImageError::io(format!(
+                                        "tile semaphore closed: {err}"
+                                    )),
+                                ),
+                            };
+                            responder.respond(response);
+                        });
+                        return;
                     }
                 }
 
-                // 未匹配路由 → 404
-                tauri::http::Response::builder()
-                    .status(404)
-                    .body(b"Not found".to_vec())
-                    .unwrap()
+                responder.respond(not_found_response());
             }
         })
         .setup(|app| {
@@ -177,16 +196,16 @@ mod tests {
     #[test]
     fn test_extract_picsee_path_localhost() {
         assert_eq!(
-            extract_picsee_path("picsee://localhost/preview/1/1"),
-            "/preview/1/1"
+            extract_picsee_path("picsee://localhost/preview/1"),
+            "/preview/1"
         );
     }
 
     #[test]
     fn test_extract_picsee_path_strips_query() {
         assert_eq!(
-            extract_picsee_path("picsee://localhost/tile/1/1/0/2/3?foo=bar"),
-            "/tile/1/1/0/2/3"
+            extract_picsee_path("picsee://localhost/tile/1/0/2/3?foo=bar"),
+            "/tile/1/0/2/3"
         );
     }
 }
