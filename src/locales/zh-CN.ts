@@ -11,7 +11,7 @@ export default {
     noImage: '未打开图片',
     imageError: '图片加载失败。',
   },
-  status: { fileName: '文件名', index: '序号', resolution: '分辨率', zoom: '缩放比', fileSize: '文件大小', largeImageMode: '大图模式' },
+  status: { fileName: '文件名', index: '序号', resolution: '分辨率', zoom: '缩放比', fileSize: '文件大小', largeImageMode: '大图模式', rawPreviewMode: 'RAW 预览模式' },
   directory: { openFailed: '打开或扫描图片目录失败' },
   file: {
     rotateClockwise: '顺时针旋转',
@@ -44,6 +44,7 @@ export default {
       IO_ERROR: '读取大图时发生错误',
       DECODE_ERROR: '大图解码失败',
       ENCODE_ERROR: '大图预览编码失败',
+      SYSTEM_DECODE_ERROR: 'macOS 系统无法解码此 TIFF、HEIC 或 RAW 文件',
     },
   },
   settings: {
@@ -66,6 +67,8 @@ export default {
     navigatorMode: '导航窗显示',
     navigatorSize: '导航窗尺寸',
     confirmDelete: '删除前确认',
+    viewerBackground: '查看区背景',
+    viewerBackgroundColor: '自定义背景色',
     fileSizeThresholdMB: '文件大小阈值（MB）',
     pixelThreshold: '像素数量阈值',
     sideThreshold: '单边长度阈值',
@@ -94,5 +97,6 @@ export default {
     left: '左侧', bottom: '底部',
     thumbnail96: '小（96px）', thumbnail160: '中（160px）', thumbnail256: '大（256px）',
     navigatorAlways: '常显', navigatorAuto: '自动', navigatorHidden: '隐藏',
+    backgroundDark: '深色', backgroundLight: '浅色', backgroundCheckerboard: '透明棋盘格', backgroundCustom: '自定义',
   },
 }

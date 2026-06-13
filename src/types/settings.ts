@@ -5,6 +5,7 @@ export type ThumbnailPosition = 'left' | 'bottom'
 export type ThumbnailSize = 96 | 160 | 256
 export type NavigatorMode = 'always' | 'auto' | 'hidden'
 export type NavigatorSize = 160 | 200 | 240
+export type ViewerBackground = 'dark' | 'light' | 'checkerboard' | 'custom'
 
 /** 与需求 v0.3 严格对应的应用设置结构。 */
 export interface AppSettings {
@@ -19,6 +20,8 @@ export interface AppSettings {
     navigatorMode: NavigatorMode
     navigatorSize: NavigatorSize
     confirmDelete: boolean
+    viewerBackground: ViewerBackground
+    viewerBackgroundColor: string
   }
   largeImage: {
     fileSizeThresholdMB: number

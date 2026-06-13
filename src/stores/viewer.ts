@@ -6,9 +6,11 @@ export type DisplayMode = 'fit-window' | 'fit-width' | 'actual-size' | 'custom'
 const MIN_ZOOM = 0.01
 const MAX_ZOOM = 32
 const MIN_VISIBLE_PIXELS = 64
+// zoom=1 表示 1 图像像素对应 1 CSS 像素；Canvas 再按 DPR 扩展物理像素。
 
 export const useViewerStore = defineStore('viewer', () => {
   const zoom = shallowRef(1)
+  const maxZoom = shallowRef(MAX_ZOOM)
   const offset = reactive({ x: 0, y: 0 })
   const displayMode = shallowRef<DisplayMode>('fit-window')
   const isFullscreen = shallowRef(false)
@@ -73,7 +75,7 @@ export const useViewerStore = defineStore('viewer', () => {
   }
 
   function setZoom(nextZoom: number, point?: { x: number; y: number }) {
-    const clamped = clampZoom(nextZoom)
+    const clamped = clampZoom(nextZoom, maxZoom.value)
     const anchor = point ?? { x: viewport.width / 2, y: viewport.height / 2 }
     const ratio = clamped / zoom.value
     offset.x = anchor.x - (anchor.x - offset.x) * ratio
@@ -137,6 +139,11 @@ export const useViewerStore = defineStore('viewer', () => {
     isFullscreen.value = value
   }
 
+  function setMaxZoom(value: number) {
+    maxZoom.value = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value))
+    if (zoom.value > maxZoom.value) setZoom(maxZoom.value)
+  }
+
   return {
     zoom,
     offset,
@@ -159,13 +166,14 @@ export const useViewerStore = defineStore('viewer', () => {
     preserveView,
     setDragging,
     setFullscreen,
+    setMaxZoom,
     rotate,
     setNormalizedCenter,
   }
 })
 
-function clampZoom(zoom: number) {
-  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom))
+function clampZoom(zoom: number, max = MAX_ZOOM) {
+  return Math.min(max, Math.max(MIN_ZOOM, zoom))
 }
 
 function clampAxis(offset: number, contentSize: number, viewportSize: number) {

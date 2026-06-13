@@ -1,3 +1,4 @@
+pub mod extended_formats;
 pub mod file_operations;
 pub mod images;
 pub mod large_image;

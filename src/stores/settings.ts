@@ -16,6 +16,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
     navigatorMode: 'auto',
     navigatorSize: 200,
     confirmDelete: false,
+    viewerBackground: 'dark',
+    viewerBackgroundColor: '#202020',
   },
   largeImage: {
     fileSizeThresholdMB: 300,

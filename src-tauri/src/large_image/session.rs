@@ -10,6 +10,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Semaphore;
 
+use crate::extended_formats;
 use crate::settings::read_settings_file;
 
 use super::{
@@ -33,6 +34,7 @@ pub struct ImageSession {
     pub preview_max_size: u32,
     /// 是否支持原始分辨率瓦片读取；M4 仅支持 24/32-bit BI_RGB BMP。
     pub tileable: bool,
+    pub raw_preview: bool,
     /// 预览图 WebP 字节。
     pub preview_webp: Vec<u8>,
 }
@@ -152,6 +154,7 @@ pub struct OpenLargeImageResult {
     pub tile_size: u32,
     pub preview_max_size: u32,
     pub tileable: bool,
+    pub raw_preview: bool,
 }
 
 /// 等比缩放，最长边 ≤ max。
@@ -240,8 +243,11 @@ pub fn generate_bmp_tile(
 
 /// 生成通用格式（非 BMP）预览图（WebP 字节）。
 pub fn generate_generic_preview(path: &Path, preview_max: u32) -> Result<Vec<u8>, LargeImageError> {
-    let img =
-        image::open(path).map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
+    let img = if extended_formats::needs_colorsync_output(path) {
+        extended_formats::decode_system_image(path).map_err(LargeImageError::system_decode)?
+    } else {
+        image::open(path).map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?
+    };
 
     let (w, h) = (img.width(), img.height());
     let (pw, ph) = scale_to_fit_correct(w, h, preview_max);
@@ -358,32 +364,53 @@ pub async fn open_large_image(
     let path_clone = path_buf.clone();
     #[cfg(debug_assertions)]
     let open_start = std::time::Instant::now();
-    let (width, height, preview_webp, tileable) = tokio::task::spawn_blocking(move || {
-        let (w, h, tileable) = if ext == "bmp" {
-            use crate::large_image::bmp::BmpInfo;
-            let info = BmpInfo::from_file(&path_clone)?;
-            (info.width, info.height, true)
-        } else {
-            let reader = image::ImageReader::open(&path_clone)
-                .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
-                .with_guessed_format()
-                .map_err(|e| LargeImageError::io(format!("猜测格式失败: {e}")))?;
-            let (w, h) = reader
-                .into_dimensions()
-                .map_err(|e| LargeImageError::decode(format!("读取尺寸失败: {e}")))?;
-            (w, h, false)
-        };
+    let (width, height, preview_webp, tileable, raw_preview) =
+        tokio::task::spawn_blocking(move || {
+            let (w, h, tileable, raw_preview) = if ext == "bmp" {
+                use crate::large_image::bmp::BmpInfo;
+                let info = BmpInfo::from_file(&path_clone)?;
+                (info.width, info.height, true, false)
+            } else if extended_formats::is_system_decoded(&path_clone) {
+                let decoded = extended_formats::decode_system_image(&path_clone)
+                    .map_err(LargeImageError::system_decode)?;
+                let (w, h) = (decoded.width(), decoded.height());
+                let preview_limit = if extended_formats::is_tiff(&path_clone)
+                    && w as u64 * (h as u64) < settings.large_image.pixel_threshold
+                {
+                    w.max(h)
+                } else {
+                    preview_max_size
+                };
+                let thumb = decoded.thumbnail(preview_limit, preview_limit).to_rgba8();
+                let preview = encode_rgba_to_webp(&thumb, thumb.width(), thumb.height(), 80.0)?;
+                return Ok::<_, LargeImageError>((
+                    w,
+                    h,
+                    preview,
+                    false,
+                    extended_formats::is_raw(&path_clone),
+                ));
+            } else {
+                let reader = image::ImageReader::open(&path_clone)
+                    .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
+                    .with_guessed_format()
+                    .map_err(|e| LargeImageError::io(format!("猜测格式失败: {e}")))?;
+                let (w, h) = reader
+                    .into_dimensions()
+                    .map_err(|e| LargeImageError::decode(format!("读取尺寸失败: {e}")))?;
+                (w, h, false, false)
+            };
 
-        let preview = if ext == "bmp" {
-            generate_bmp_preview(&path_clone, preview_max_size)?
-        } else {
-            generate_generic_preview(&path_clone, preview_max_size)?
-        };
+            let preview = if ext == "bmp" {
+                generate_bmp_preview(&path_clone, preview_max_size)?
+            } else {
+                generate_generic_preview(&path_clone, preview_max_size)?
+            };
 
-        Ok::<_, LargeImageError>((w, h, preview, tileable))
-    })
-    .await
-    .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))??;
+            Ok::<_, LargeImageError>((w, h, preview, tileable, raw_preview))
+        })
+        .await
+        .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))??;
 
     #[cfg(debug_assertions)]
     println!(
@@ -405,6 +432,7 @@ pub async fn open_large_image(
         tile_size,
         preview_max_size,
         tileable,
+        raw_preview,
         preview_webp,
     });
     let result = OpenLargeImageResult {
@@ -414,6 +442,7 @@ pub async fn open_large_image(
         tile_size,
         preview_max_size,
         tileable,
+        raw_preview,
     };
     guard.add_session(session);
 
@@ -478,6 +507,7 @@ mod tests {
             tile_size: 512,
             preview_max_size: 4096,
             tileable: true,
+            raw_preview: false,
             preview_webp: vec![],
         })
     }

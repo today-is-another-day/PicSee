@@ -191,7 +191,7 @@ function render() {
   const cssW = canvas.clientWidth
   const cssH = canvas.clientHeight
 
-  // 更新 canvas 物理分辨率（HiDPI）
+  // HiDPI：zoom=1 仍为 1 图像像素:1 CSS 像素，Canvas 物理尺寸按 DPR 扩展。
   if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
     canvas.width = Math.round(cssW * dpr)
     canvas.height = Math.round(cssH * dpr)

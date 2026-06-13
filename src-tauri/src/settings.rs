@@ -64,6 +64,15 @@ pub enum NavigatorMode {
     Hidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerBackground {
+    Dark,
+    Light,
+    Checkerboard,
+    Custom,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u32)]
 pub enum NavigatorSize {
@@ -127,6 +136,10 @@ pub struct ViewerSettings {
     pub navigator_size: NavigatorSize,
     /// 删除前是否确认。
     pub confirm_delete: bool,
+    /// 查看区背景。
+    pub viewer_background: ViewerBackground,
+    /// 自定义查看区背景色。
+    pub viewer_background_color: String,
 }
 
 /// 大图处理设置。
@@ -223,6 +236,8 @@ impl Default for ViewerSettings {
             navigator_mode: NavigatorMode::Auto,
             navigator_size: NavigatorSize::Size200,
             confirm_delete: false,
+            viewer_background: ViewerBackground::Dark,
+            viewer_background_color: "#202020".to_string(),
         }
     }
 }

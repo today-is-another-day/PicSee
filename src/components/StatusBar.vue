@@ -12,6 +12,7 @@ const directoryStore = useDirectoryStore()
 const imageStore = useImageStore()
 const viewerStore = useViewerStore()
 const { loadMode } = storeToRefs(imageStore)
+const rawPreview = computed(() => imageStore.largeImageSession?.rawPreview ?? false)
 const resolution = computed(() => imageStore.naturalWidth && imageStore.naturalHeight
   ? `${imageStore.naturalWidth} × ${imageStore.naturalHeight}`
   : '-')
@@ -42,6 +43,7 @@ function formatFileSize(bytes?: number) {
     <span v-if="loadMode && loadMode !== 'normal'" class="status-bar__badge">
       {{ t('status.largeImageMode') }}
     </span>
+    <span v-if="rawPreview" class="status-bar__badge">{{ t('status.rawPreviewMode') }}</span>
   </footer>
 </template>
 

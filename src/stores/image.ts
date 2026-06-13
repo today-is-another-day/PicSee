@@ -66,6 +66,7 @@ export const useImageStore = defineStore('image', () => {
 
   /** 由 useLargeImage 在 probe 完成后调用：确认走普通路径。 */
   function setNormalMode(entry: ImageEntry) {
+    useViewerStore().setMaxZoom(32)
     loadMode.value = 'normal'
     src.value = convertFileSrc(entry.path)
     // loading 保持 true，等 <img> onload 后由 markLoaded 翻转
@@ -85,6 +86,7 @@ export const useImageStore = defineStore('image', () => {
     loading.value = false
     error.value = null
     const viewerStore = useViewerStore()
+    viewerStore.setMaxZoom(session.rawPreview ? 1 : 32)
     viewerStore.setImageSize(width, height)
     if (viewerStore.displayMode !== 'custom') viewerStore.applyDisplayMode(viewerStore.displayMode)
   }

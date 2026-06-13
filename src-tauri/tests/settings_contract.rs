@@ -1,6 +1,6 @@
 use picsee_lib::settings::{
     AppSettings, DefaultZoomMode, Language, NavigatorMode, NavigatorSize, PreviewMaxSize, Theme,
-    ThumbnailPosition, TileSize,
+    ThumbnailPosition, TileSize, ViewerBackground,
 };
 
 #[test]
@@ -16,6 +16,8 @@ fn default_settings_match_expected_baseline() {
     assert_eq!(settings.viewer.navigator_mode, NavigatorMode::Auto);
     assert_eq!(settings.viewer.navigator_size, NavigatorSize::Size200);
     assert!(!settings.viewer.confirm_delete);
+    assert_eq!(settings.viewer.viewer_background, ViewerBackground::Dark);
+    assert_eq!(settings.viewer.viewer_background_color, "#202020");
     assert_eq!(
         settings.large_image.preview_max_size,
         PreviewMaxSize::Size4096
@@ -35,6 +37,8 @@ fn settings_serialize_with_camel_case_fields_and_enum_values() {
     let value = serde_json::to_value(AppSettings::default()).expect("设置应可序列化");
 
     assert_eq!(value["viewer"]["defaultZoomMode"], "fit-window");
+    assert_eq!(value["viewer"]["viewerBackground"], "dark");
+    assert_eq!(value["viewer"]["viewerBackgroundColor"], "#202020");
     assert!(value["largeImage"]["fileSizeThresholdMB"].is_number());
     assert!(value["cache"]["memoryCacheLimitMB"].is_number());
     assert!(value["cache"]["diskCacheLimitMB"].is_number());
@@ -68,6 +72,7 @@ fn settings_with_missing_fields_use_defaults() {
     assert_eq!(settings.theme, Theme::System);
     assert_eq!(settings.viewer.zoom_step, 0.25);
     assert!(settings.viewer.smooth_zoom);
+    assert_eq!(settings.viewer.viewer_background, ViewerBackground::Dark);
     assert_eq!(settings.large_image, AppSettings::default().large_image);
 }
 

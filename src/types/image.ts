@@ -48,6 +48,7 @@ export interface ImageProbe {
   isLarge: boolean
   loadMode: LoadMode
   tileable: boolean
+  rawPreview: boolean
 }
 
 /** open_large_image command 返回值。 */
@@ -58,6 +59,7 @@ export interface OpenLargeImageResult {
   tileSize: number
   previewMaxSize: number
   tileable: boolean
+  rawPreview: boolean
 }
 
 /** 前端维护的大图会话状态。 */

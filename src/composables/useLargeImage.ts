@@ -11,6 +11,9 @@ import type {
 
 /** 调用 token，每次 openImage 递增，用于取消旧的 in-flight 请求。 */
 let currentToken = 0
+const SYSTEM_DECODE_FORMATS = new Set([
+  'tif', 'tiff', 'heic', 'heif', 'dng', 'cr2', 'cr3', 'nef', 'arw', 'raf', 'orf', 'rw2',
+])
 
 /** TODO M4-debug：上报耗时事件到 vite dev server（DEV only）。 */
 function reportE2E(data: Record<string, unknown>): void {
@@ -102,11 +105,17 @@ export function useLargeImage() {
         closeSession(oldSession)
         return
       }
-      // SVG 等 image crate 无法探测的格式继续交给 WebView 普通 img 路径。
-      imageStore.setNormalMode(entry)
-      closeSession(oldSession)
-      if (import.meta.env.DEV) console.warn('[PicSee] probe_image failed; falling back to img:', err)
-      reportE2E({ event: 'probe_fallback', message: String(err) })
+      const extension = entry.path.split('.').pop()?.toLowerCase()
+      if (extension === 'svg') {
+        imageStore.setNormalMode(entry)
+        closeSession(oldSession)
+        if (import.meta.env.DEV) console.warn('[PicSee] probe_image failed; falling back to img:', err)
+        reportE2E({ event: 'probe_fallback', message: String(err) })
+      }
+      else {
+        closeSession(oldSession)
+        imageStore.markError(localizeError(err))
+      }
       return
     }
 
@@ -139,7 +148,7 @@ export function useLargeImage() {
         closeSession(oldSession)
         return
       }
-      if (probe.loadMode === 'largeCandidate') {
+      if (probe.loadMode === 'largeCandidate' && !SYSTEM_DECODE_FORMATS.has(probe.format.toLowerCase())) {
         imageStore.setNormalMode(entry)
         closeSession(oldSession)
         if (import.meta.env.DEV) console.warn('[PicSee] open_large_image failed; falling back to img:', err)

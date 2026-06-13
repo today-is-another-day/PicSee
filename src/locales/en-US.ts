@@ -11,7 +11,7 @@ export default {
     noImage: 'No image opened',
     imageError: 'The image could not be loaded.',
   },
-  status: { fileName: 'File', index: 'Index', resolution: 'Resolution', zoom: 'Zoom', fileSize: 'File size', largeImageMode: 'Large image mode' },
+  status: { fileName: 'File', index: 'Index', resolution: 'Resolution', zoom: 'Zoom', fileSize: 'File size', largeImageMode: 'Large image mode', rawPreviewMode: 'RAW preview mode' },
   directory: { openFailed: 'Could not open or scan the image folder' },
   file: {
     rotateClockwise: 'Rotate clockwise',
@@ -44,6 +44,7 @@ export default {
       IO_ERROR: 'An error occurred while reading the large image',
       DECODE_ERROR: 'The large image could not be decoded',
       ENCODE_ERROR: 'The large-image preview could not be encoded',
+      SYSTEM_DECODE_ERROR: 'macOS could not decode this TIFF, HEIC, or RAW file',
     },
   },
   settings: {
@@ -66,6 +67,8 @@ export default {
     navigatorMode: 'Navigator visibility',
     navigatorSize: 'Navigator size',
     confirmDelete: 'Confirm before deleting',
+    viewerBackground: 'Viewer background',
+    viewerBackgroundColor: 'Custom background color',
     fileSizeThresholdMB: 'File size threshold (MB)',
     pixelThreshold: 'Pixel count threshold',
     sideThreshold: 'Single-side threshold',
@@ -94,5 +97,6 @@ export default {
     left: 'Left', bottom: 'Bottom',
     thumbnail96: 'Small (96px)', thumbnail160: 'Medium (160px)', thumbnail256: 'Large (256px)',
     navigatorAlways: 'Always', navigatorAuto: 'Auto', navigatorHidden: 'Hidden',
+    backgroundDark: 'Dark', backgroundLight: 'Light', backgroundCheckerboard: 'Transparency checkerboard', backgroundCustom: 'Custom',
   },
 }

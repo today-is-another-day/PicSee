@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::{fs, path::Path};
 use tauri::AppHandle;
 
+use crate::extended_formats;
 use crate::settings::LargeImageSettings;
 
 use super::LargeImageError;
@@ -29,6 +30,7 @@ pub struct ImageProbe {
     pub is_large: bool,
     pub load_mode: LoadMode,
     pub tileable: bool,
+    pub raw_preview: bool,
 }
 
 /// 判断图像是否为大图。
@@ -105,9 +107,13 @@ pub fn probe_image_file(
         .unwrap_or("")
         .to_lowercase();
 
-    let (width, height, format, tileable) = if ext == "bmp" {
+    let (width, height, format, tileable, raw_preview) = if ext == "bmp" {
         let info = super::bmp::BmpInfo::from_file(path)?;
-        (info.width, info.height, "bmp".to_string(), true)
+        (info.width, info.height, "bmp".to_string(), true, false)
+    } else if extended_formats::is_system_decoded(path) {
+        let (w, h) =
+            extended_formats::probe_system_image(path).map_err(LargeImageError::system_decode)?;
+        (w, h, ext.clone(), false, extended_formats::is_raw(path))
     } else {
         let reader = image::ImageReader::open(path)
             .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
@@ -120,11 +126,15 @@ pub fn probe_image_file(
         let (w, h) = reader
             .into_dimensions()
             .map_err(|e| LargeImageError::decode(format!("读取图像尺寸失败: {e}")))?;
-        (w, h, fmt, false)
+        (w, h, fmt, false, false)
     };
 
     let is_large = is_large_image(width, height, file_size, &ext, settings);
-    let load_mode = determine_load_mode(width, height, file_size, &ext, settings);
+    let load_mode = if extended_formats::is_system_decoded(path) {
+        LoadMode::LargeCandidate
+    } else {
+        determine_load_mode(width, height, file_size, &ext, settings)
+    };
 
     Ok(ImageProbe {
         width,
@@ -134,6 +144,7 @@ pub fn probe_image_file(
         is_large,
         load_mode,
         tileable,
+        raw_preview,
     })
 }
 
@@ -179,10 +190,28 @@ pub async fn probe_image(app: AppHandle, path: String) -> Result<ImageProbe, Lar
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::process::Command;
     use tempfile::NamedTempFile;
 
     fn default_settings() -> LargeImageSettings {
         LargeImageSettings::default()
+    }
+
+    fn make_system_decoded_file(extension: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("source.png");
+        let output = directory.path().join(format!("source.{extension}"));
+        image::DynamicImage::new_rgb8(8, 6).save(&png).unwrap();
+        assert!(Command::new("sips")
+            .args(["-s", "format", "tiff"])
+            .arg(&png)
+            .args(["--out"])
+            .arg(&output)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        directory
     }
 
     // ── is_large_image ──
@@ -324,5 +353,25 @@ mod tests {
         let result = super::super::bmp::BmpInfo::from_file(f.path());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, "DECODE_ERROR");
+    }
+
+    #[test]
+    fn test_probe_tiff_is_preview_only() {
+        let directory = make_system_decoded_file("tiff");
+        let probe = probe_image_file(&directory.path().join("source.tiff"), &default_settings())
+            .expect("TIFF 应由系统解码器探测");
+        assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+        assert!(!probe.tileable);
+        assert!(!probe.raw_preview);
+    }
+
+    #[test]
+    fn test_probe_raw_is_preview_only() {
+        let directory = make_system_decoded_file("dng");
+        let probe = probe_image_file(&directory.path().join("source.dng"), &default_settings())
+            .expect("RAW embedded preview 应由系统解码器探测");
+        assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+        assert!(!probe.tileable);
+        assert!(probe.raw_preview);
     }
 }

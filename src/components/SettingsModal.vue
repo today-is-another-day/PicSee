@@ -52,6 +52,12 @@ const navigatorModeOptions = computed(() => [
   { value: 'hidden', label: t('option.navigatorHidden') },
 ])
 const navigatorSizeOptions = [160, 200, 240].map(value => ({ value, label: `${value}px` }))
+const viewerBackgroundOptions = computed(() => [
+  { value: 'dark', label: t('option.backgroundDark') },
+  { value: 'light', label: t('option.backgroundLight') },
+  { value: 'checkerboard', label: t('option.backgroundCheckerboard') },
+  { value: 'custom', label: t('option.backgroundCustom') },
+])
 
 async function handleSave() {
   try {
@@ -111,6 +117,8 @@ function handleCancel() {
           <a-form-item :label="t('settings.navigatorMode')"><a-select v-model:value="draft.viewer.navigatorMode" :options="navigatorModeOptions" /></a-form-item>
           <a-form-item :label="t('settings.navigatorSize')"><a-select v-model:value="draft.viewer.navigatorSize" :options="navigatorSizeOptions" /></a-form-item>
           <a-form-item :label="t('settings.confirmDelete')"><a-switch v-model:checked="draft.viewer.confirmDelete" /></a-form-item>
+          <a-form-item :label="t('settings.viewerBackground')"><a-select v-model:value="draft.viewer.viewerBackground" :options="viewerBackgroundOptions" /></a-form-item>
+          <a-form-item v-if="draft.viewer.viewerBackground === 'custom'" :label="t('settings.viewerBackgroundColor')"><a-input v-model:value="draft.viewer.viewerBackgroundColor" type="color" /></a-form-item>
         </a-form>
       </a-tab-pane>
 

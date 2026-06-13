@@ -1,3 +1,4 @@
+use crate::extended_formats;
 use image::{DynamicImage, ImageFormat, ImageReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -12,7 +13,10 @@ use tauri::{AppHandle, Manager};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Supported thumbnail format extensions (lowercase).
-const THUMBNAIL_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+const THUMBNAIL_EXTENSIONS: [&str; 18] = [
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "tif", "heic", "heif", "dng", "cr2", "cr3",
+    "nef", "arw", "raf", "orf", "rw2",
+];
 
 /// Skip thumbnail when either side exceeds this pixel count or file exceeds MAX_FILE_BYTES.
 const MAX_SIDE_PIXELS: u32 = 12_000;
@@ -130,7 +134,7 @@ pub async fn get_thumbnail(
     })?;
 
     let file_size = metadata.len();
-    if file_size > MAX_FILE_BYTES {
+    if file_size > MAX_FILE_BYTES && !extended_formats::is_system_decoded(&file_path) {
         return Err(ThumbnailError::new(
             "FILE_TOO_LARGE",
             "File exceeds 100 MB; thumbnail skipped",
@@ -330,7 +334,7 @@ pub fn generate_thumbnail(
         .to_ascii_lowercase();
 
     // M1: read image dimensions from header before full decode; reject oversized images early.
-    {
+    if !extended_formats::is_system_decoded(path) {
         let reader = ImageReader::open(path)
             .map_err(|e| GenError::IoFailed(format!("Failed to open image file: {e}")))?
             .with_guessed_format()
@@ -344,9 +348,12 @@ pub fn generate_thumbnail(
         }
     }
 
-    // Read raw bytes (needed for EXIF orientation).
-    let raw = fs::read(path)
-        .map_err(|e| GenError::IoFailed(format!("Failed to read image file: {e}")))?;
+    // 系统/ColorSync 解码链路直接读取路径，避免对 HEIC/RAW 再整文件读入内存。
+    let raw = if extended_formats::needs_colorsync_output(path) {
+        Vec::new()
+    } else {
+        fs::read(path).map_err(|e| GenError::IoFailed(format!("Failed to read image file: {e}")))?
+    };
 
     // Decode image.
     let img = decode_image(&raw, &ext, path)
@@ -376,6 +383,9 @@ pub fn generate_thumbnail(
 
 /// Decode image; for JPEG/WebP/PNG apply EXIF orientation when available.
 pub fn decode_image(raw: &[u8], ext: &str, path: &Path) -> Result<DynamicImage, String> {
+    if extended_formats::needs_colorsync_output(path) {
+        return extended_formats::decode_system_image(path);
+    }
     // GIF: take only the first frame (image crate default).
     if ext == "gif" {
         let img = image::load_from_memory_with_format(raw, ImageFormat::Gif)
@@ -583,5 +593,21 @@ mod tests {
             GenError::DecodeFailed(_) | GenError::IoFailed(_) => {}
             GenError::ImageTooLarge => panic!("Should not be ImageTooLarge for garbage bytes"),
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_jpeg_decode() {
+        let jpeg = make_jpeg_bytes(4000, 3000);
+        let mut file = NamedTempFile::with_suffix(".jpg").unwrap();
+        file.write_all(&jpeg).unwrap();
+        let start = std::time::Instant::now();
+        let decoded = decode_image(&jpeg, "jpg", file.path()).unwrap();
+        println!(
+            "JPEG ImageIO/ColorSync decode {}×{}: {}ms",
+            decoded.width(),
+            decoded.height(),
+            start.elapsed().as_millis()
+        );
     }
 }

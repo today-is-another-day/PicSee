@@ -23,6 +23,10 @@ const errorMessage = computed(() => {
   if (error.value instanceof Error) return error.value.message
   return t('placeholder.imageError')
 })
+const viewerClasses = computed(() => `image-viewer--${settingsStore.settings.viewer.viewerBackground}`)
+const viewerBackgroundStyle = computed(() => settingsStore.settings.viewer.viewerBackground === 'custom'
+  ? { backgroundColor: settingsStore.settings.viewer.viewerBackgroundColor }
+  : undefined)
 const menuItems = computed(() => [
   { key: 'rotate-clockwise', label: t('file.rotateClockwise') },
   { key: 'rotate-counter-clockwise', label: t('file.rotateCounterClockwise') },
@@ -137,7 +141,8 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
     <section
       ref="viewer"
       class="image-viewer"
-      :class="{ 'image-viewer--dragging': viewerStore.isDragging }"
+      :class="[viewerClasses, { 'image-viewer--dragging': viewerStore.isDragging }]"
+      :style="viewerBackgroundStyle"
       @dblclick="handleDoubleClick"
       @pointerdown="handlePointerDown"
       @pointermove="handlePointerMove"
@@ -186,6 +191,14 @@ onBeforeUnmount(() => resizeObserver?.disconnect())
   cursor: grab;
   touch-action: none;
   user-select: none;
+}
+.image-viewer--dark { background: #202020; }
+.image-viewer--light { background: #f3f3f3; }
+.image-viewer--checkerboard {
+  background-color: #ddd;
+  background-image: linear-gradient(45deg, #bbb 25%, transparent 25%), linear-gradient(-45deg, #bbb 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #bbb 75%), linear-gradient(-45deg, transparent 75%, #bbb 75%);
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-size: 16px 16px;
 }
 
 .image-viewer--dragging {
