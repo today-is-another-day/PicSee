@@ -16,12 +16,10 @@ fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
 #[tauri::command]
 pub async fn move_to_trash(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let canonical = PathBuf::from(path)
-            .canonicalize()
-            .map_err(|error| format!("无法读取待删除文件: {error}"))?;
+        let trash_path = path_without_resolving_symlink(&PathBuf::from(path))?;
         let script = format!(
             "tell application \"Finder\" to delete POSIX file {}",
-            apple_script_string(&canonical.to_string_lossy())
+            apple_script_string(&trash_path.to_string_lossy())
         );
         run_command("osascript", &["-e", &script])
     })
@@ -52,7 +50,23 @@ pub async fn copy_file_to_clipboard(path: String) -> Result<(), String> {
 }
 
 fn apple_script_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\" & return & \"")
+        .replace('\n', "\" & linefeed & \"");
+    format!("\"{escaped}\"")
+}
+
+fn path_without_resolving_symlink(path: &std::path::Path) -> Result<PathBuf, String> {
+    std::fs::symlink_metadata(path).map_err(|error| format!("无法读取待删除文件: {error}"))?;
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(path))
+            .map_err(|error| format!("无法读取当前目录: {error}"))
+    }
 }
 
 #[cfg(test)]
@@ -76,5 +90,27 @@ mod tests {
     #[test]
     fn apple_script_string_escapes_quotes() {
         assert_eq!(apple_script_string("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn apple_script_string_escapes_newlines() {
+        assert_eq!(
+            apple_script_string("a\nb\rc"),
+            "\"a\" & linefeed & \"b\" & return & \"c\""
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_path_does_not_resolve_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.png");
+        let link = temp.path().join("link.png");
+        std::fs::write(&target, b"image").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(path_without_resolving_symlink(&link).unwrap(), link);
     }
 }

@@ -140,7 +140,10 @@ function handleKeydown(event: KeyboardEvent) {
     void fileOperations.revealCurrent()
     return
   }
-  if (command && event.key.toLowerCase() === 'c') {
+  const selection = window.getSelection()
+  if (command && event.key.toLowerCase() === 'c'
+    && directoryStore.currentEntry
+    && (!selection || selection.isCollapsed)) {
     event.preventDefault()
     void fileOperations.copyCurrentFile()
     return
@@ -201,6 +204,7 @@ onMounted(async () => {
     viewerStore.setFullscreen(false)
   }
   const openPaths = (paths: string[]) => {
+    // 单图浏览模式仅取首个路径；文件打开后会扫描其所在目录并补齐同目录列表。
     const path = paths[0]
     if (path) void directoryStore.openExternalPath(path)
   }

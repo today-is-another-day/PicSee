@@ -16,9 +16,19 @@ use thumbnails::{clear_thumbnail_cache, get_thumbnail, ThumbnailState};
 #[derive(Default)]
 struct PendingOpenPaths(Mutex<Vec<String>>);
 
+impl PendingOpenPaths {
+    fn new(paths: Vec<String>) -> Self {
+        Self(Mutex::new(paths))
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
 #[tauri::command]
 fn take_pending_open_paths(state: tauri::State<'_, PendingOpenPaths>) -> Vec<String> {
-    std::mem::take(&mut *state.0.lock().unwrap())
+    state.take()
 }
 
 /// 从 picsee:// URL 中提取路径部分（不含 query string）。
@@ -172,9 +182,9 @@ pub fn run() {
                 tile_concurrency,
                 memory_limit_mb,
             ))));
-            app.manage(PendingOpenPaths(Mutex::new(images::extract_open_paths(
+            app.manage(PendingOpenPaths::new(images::extract_open_paths(
                 std::env::args(),
-            ))));
+            )));
 
             // 授权缩略图缓存目录
             if let Ok(cache_dir) = app.path().app_cache_dir() {
@@ -214,11 +224,7 @@ pub fn run() {
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect();
                 if !paths.is_empty() {
-                    app.state::<PendingOpenPaths>()
-                        .0
-                        .lock()
-                        .unwrap()
-                        .extend(paths.clone());
+                    // 运行期 Apple Event 只走事件通道，避免与启动 argv 队列重复打开。
                     let _ = app.emit("open-paths", paths);
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
@@ -231,7 +237,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_picsee_path;
+    use super::{extract_picsee_path, PendingOpenPaths};
 
     #[test]
     fn test_extract_picsee_path_localhost() {
@@ -247,5 +253,13 @@ mod tests {
             extract_picsee_path("picsee://localhost/tile/1/0/2/3?foo=bar"),
             "/tile/1/0/2/3"
         );
+    }
+
+    #[test]
+    fn pending_argv_paths_are_consumed_once() {
+        let pending = PendingOpenPaths::new(vec!["/tmp/image.png".to_string()]);
+
+        assert_eq!(pending.take(), vec!["/tmp/image.png"]);
+        assert!(pending.take().is_empty());
     }
 }
