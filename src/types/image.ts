@@ -61,6 +61,10 @@ export interface OpenLargeImageResult {
   previewMaxSize: number
   tileable: boolean
   rawPreview: boolean
+  /** 预览图像素宽（前端按此构造 ImageData）。 */
+  previewW: number
+  /** 预览图像素高。 */
+  previewH: number
 }
 
 /** 前端维护的大图会话状态。 */

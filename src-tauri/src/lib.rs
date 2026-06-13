@@ -8,7 +8,7 @@ pub mod thumbnails;
 use file_operations::{copy_file_to_clipboard, move_to_trash, reveal_in_finder};
 use images::{open_directory, open_external_path, open_image_file, scan_directory};
 use large_image::policy::probe_image;
-use large_image::session::{close_large_image, open_large_image, LargeImageState};
+use large_image::session::{close_large_image, get_preview, open_large_image, LargeImageState};
 use settings::{get_settings, read_settings_file, save_settings};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
@@ -101,7 +101,7 @@ pub fn run() {
                     .inner()
                     .clone();
 
-                // /preview/{session_id}
+                // /preview/{session_id} —— 导航窗小 WebP（主画布预览走 get_preview 命令）
                 if segments.first() == Some(&"preview") && segments.len() == 2 {
                     if let Some(session_id) = parse_u64(segments[1]) {
                         let response = match large_image::session::handle_preview_request(
@@ -212,6 +212,7 @@ pub fn run() {
             probe_image,
             open_large_image,
             close_large_image,
+            get_preview,
             take_pending_open_paths,
         ])
         .build(tauri::generate_context!())

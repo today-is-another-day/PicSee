@@ -23,6 +23,13 @@ use super::{
 /// 瓦片缓存键：(session_id, zoom_level, tile_x, tile_y)。
 type TileKey = (u64, u32, u32, u32);
 
+/// 常驻预览（原始 RGBA）的最长边上限，控制内存占用。
+/// 清晰度由瓦片保证，故基础预览不需要太大；2048 边长 ≈ 14MB/会话。
+const PREVIEW_RAW_CAP: u32 = 2048;
+
+/// 导航窗预览最长边上限（小图，供 NavigatorOverlay 的 <img> 显示）。
+const NAV_PREVIEW_CAP: u32 = 384;
+
 /// 单个大图会话。
 #[derive(Debug)]
 pub struct ImageSession {
@@ -35,8 +42,11 @@ pub struct ImageSession {
     /// 是否支持原始分辨率瓦片读取；M4 仅支持 24/32-bit BI_RGB BMP。
     pub tileable: bool,
     pub raw_preview: bool,
-    /// 预览图 WebP 字节。
-    pub preview_webp: Vec<u8>,
+    /// 预览图原始 RGBA 字节（不编码，前端用 ImageData 渲染，避免 WebP 编码耗时）。
+    /// 像素尺寸通过 OpenLargeImageResult.preview_w/h 告知前端。
+    pub preview_rgba: Vec<u8>,
+    /// 导航窗用的小 WebP（供 NavigatorOverlay 的 <img> 显示，不能用原始 RGBA）。
+    pub nav_preview_webp: Vec<u8>,
 }
 
 /// 全局大图状态（通过 Arc<Mutex<LargeImageState>> 注册为 managed state）。
@@ -155,6 +165,10 @@ pub struct OpenLargeImageResult {
     pub preview_max_size: u32,
     pub tileable: bool,
     pub raw_preview: bool,
+    /// 预览图像素宽（前端按此尺寸构造 ImageData）。
+    pub preview_w: u32,
+    /// 预览图像素高。
+    pub preview_h: u32,
 }
 
 /// 等比缩放，最长边 ≤ max。
@@ -195,14 +209,15 @@ pub fn encode_rgba_to_webp(
     Ok(bytes)
 }
 
-/// 生成 BMP 预览图（WebP 字节）。
+/// 生成 BMP 预览图（原始 RGBA 字节 + 尺寸）。
 pub fn generate_bmp_preview(
     path: &Path,
     preview_max_size: u32,
     threads: u32,
-) -> Result<Vec<u8>, LargeImageError> {
+) -> Result<(Vec<u8>, u32, u32), LargeImageError> {
     let reader = BmpReader::open(path)?;
-    let (pw, ph) = scale_to_fit_correct(reader.info.width, reader.info.height, preview_max_size);
+    let cap = preview_max_size.min(PREVIEW_RAW_CAP);
+    let (pw, ph) = scale_to_fit_correct(reader.info.width, reader.info.height, cap);
     let rect = Rect {
         x: 0,
         y: 0,
@@ -210,7 +225,7 @@ pub fn generate_bmp_preview(
         height: reader.info.height,
     };
     let rgba = reader.read_region_parallel(rect, pw, ph, threads)?;
-    encode_rgba_to_webp(&rgba, pw, ph, 80.0)
+    Ok((rgba, pw, ph))
 }
 
 /// 生成 BMP 瓦片（WebP 字节）。
@@ -242,8 +257,11 @@ pub fn generate_bmp_tile(
     encode_rgba_to_webp(&rgba, w, h, 85.0)
 }
 
-/// 生成通用格式（非 BMP）预览图（WebP 字节）。
-pub fn generate_generic_preview(path: &Path, preview_max: u32) -> Result<Vec<u8>, LargeImageError> {
+/// 生成通用格式（非 BMP）预览图（原始 RGBA 字节 + 尺寸）。
+pub fn generate_generic_preview(
+    path: &Path,
+    preview_max: u32,
+) -> Result<(Vec<u8>, u32, u32), LargeImageError> {
     let img = if extended_formats::needs_colorsync_output(path) {
         extended_formats::decode_system_image(path).map_err(LargeImageError::system_decode)?
     } else {
@@ -251,18 +269,44 @@ pub fn generate_generic_preview(path: &Path, preview_max: u32) -> Result<Vec<u8>
     };
 
     let (w, h) = (img.width(), img.height());
-    let (pw, ph) = scale_to_fit_correct(w, h, preview_max);
+    let cap = preview_max.min(PREVIEW_RAW_CAP);
+    let (pw, ph) = scale_to_fit_correct(w, h, cap);
 
     let thumb = img.thumbnail(pw, ph);
-    // M4 非 BMP preview 仍需一次整图解码；缩略后立即释放原始缓冲，M6 改为增量解码。
+    // 缩略后立即释放原始缓冲。
     drop(img);
     let rgba = thumb.to_rgba8();
-    encode_rgba_to_webp(rgba.as_raw(), thumb.width(), thumb.height(), 80.0)
+    Ok((rgba.into_raw(), thumb.width(), thumb.height()))
 }
 
 // ─────────────────────────── 协议处理器 ───────────────────────────
 
-/// 处理 picsee://localhost/preview/{session_id} 请求。
+/// 最近邻把 RGBA 缩到最长边 ≤ cap，返回 (rgba, w, h)。
+fn downscale_rgba(src: &[u8], sw: u32, sh: u32, cap: u32) -> (Vec<u8>, u32, u32) {
+    let (nw, nh) = scale_to_fit_correct(sw, sh, cap);
+    if nw == sw && nh == sh {
+        return (src.to_vec(), sw, sh);
+    }
+    let mut out = vec![0u8; nw as usize * nh as usize * 4];
+    for ty in 0..nh {
+        let sy = (ty as u64 * sh as u64 / nh as u64) as u32;
+        for tx in 0..nw {
+            let sx = (tx as u64 * sw as u64 / nw as u64) as u32;
+            let si = (sy as usize * sw as usize + sx as usize) * 4;
+            let di = (ty as usize * nw as usize + tx as usize) * 4;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    (out, nw, nh)
+}
+
+/// 从预览 RGBA 生成导航窗用的小 WebP（最长边 ≤ NAV_PREVIEW_CAP，编码极快）。
+pub fn make_nav_preview(preview_rgba: &[u8], pw: u32, ph: u32) -> Result<Vec<u8>, LargeImageError> {
+    let (small, nw, nh) = downscale_rgba(preview_rgba, pw, ph, NAV_PREVIEW_CAP);
+    encode_rgba_to_webp(&small, nw, nh, 80.0)
+}
+
+/// 处理 picsee://localhost/preview/{session_id} 请求（返回导航窗小 WebP）。
 pub fn handle_preview_request(
     state: &Mutex<LargeImageState>,
     session_id: u64,
@@ -271,7 +315,7 @@ pub fn handle_preview_request(
     let session = guard
         .find_session(session_id)
         .ok_or_else(|| (404, LargeImageError::session_not_found(session_id)))?;
-    Ok(session.preview_webp.clone())
+    Ok(session.nav_preview_webp.clone())
 }
 
 /// 处理 picsee://localhost/tile/{session_id}/{z}/{tx}/{ty} 请求。
@@ -377,7 +421,7 @@ pub async fn open_large_image(
     let path_clone = path_buf.clone();
     #[cfg(debug_assertions)]
     let open_start = std::time::Instant::now();
-    let (width, height, preview_webp, tileable, raw_preview) =
+    let (width, height, preview_rgba, preview_w, preview_h, tileable, raw_preview) =
         tokio::task::spawn_blocking(move || {
             let (w, h, tileable, raw_preview) = if ext == "bmp" {
                 use crate::large_image::bmp::BmpInfo;
@@ -396,13 +440,16 @@ pub async fn open_large_image(
                     w.max(h)
                 } else {
                     preview_max_size
-                };
+                }
+                .min(PREVIEW_RAW_CAP);
                 let thumb = decoded.thumbnail(preview_limit, preview_limit).to_rgba8();
-                let preview = encode_rgba_to_webp(&thumb, thumb.width(), thumb.height(), 80.0)?;
+                let (tw, th) = (thumb.width(), thumb.height());
                 return Ok::<_, LargeImageError>((
                     w,
                     h,
-                    preview,
+                    thumb.into_raw(),
+                    tw,
+                    th,
                     false,
                     extended_formats::is_raw(&path_clone),
                 ));
@@ -417,13 +464,13 @@ pub async fn open_large_image(
                 (w, h, false, false)
             };
 
-            let preview = if ext == "bmp" {
+            let (preview, pw, ph) = if ext == "bmp" {
                 generate_bmp_preview(&path_clone, preview_max_size, cpu_threads)?
             } else {
                 generate_generic_preview(&path_clone, preview_max_size)?
             };
 
-            Ok::<_, LargeImageError>((w, h, preview, tileable, raw_preview))
+            Ok::<_, LargeImageError>((w, h, preview, pw, ph, tileable, raw_preview))
         })
         .await
         .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))??;
@@ -435,6 +482,9 @@ pub async fn open_large_image(
         height,
         open_start.elapsed().as_millis()
     );
+
+    // 导航窗小 WebP（从预览 RGBA 降采样后编码，体量小、耗时毫秒级）。
+    let nav_preview_webp = make_nav_preview(&preview_rgba, preview_w, preview_h)?;
 
     // 注册到 managed state
     let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
@@ -449,7 +499,8 @@ pub async fn open_large_image(
         preview_max_size,
         tileable,
         raw_preview,
-        preview_webp,
+        preview_rgba,
+        nav_preview_webp,
     });
     let result = OpenLargeImageResult {
         session_id: session.session_id,
@@ -459,6 +510,8 @@ pub async fn open_large_image(
         preview_max_size,
         tileable,
         raw_preview,
+        preview_w,
+        preview_h,
     };
     guard.add_session(session);
 
@@ -472,6 +525,18 @@ pub async fn close_large_image(app: AppHandle, session_id: u64) -> Result<(), La
     let mut guard = state_arc.lock().unwrap();
     guard.remove_session(session_id);
     Ok(())
+}
+
+/// 获取预览原始 RGBA 字节（通过 IPC raw response，避免 fetch 自定义协议在 WKWebView 受限）。
+/// 前端按 OpenLargeImageResult.previewW/previewH 构造 ImageData。
+#[tauri::command]
+pub fn get_preview(app: AppHandle, session_id: u64) -> Result<tauri::ipc::Response, LargeImageError> {
+    let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
+    let guard = state_arc.lock().unwrap();
+    let session = guard
+        .find_session(session_id)
+        .ok_or_else(|| LargeImageError::session_not_found(session_id))?;
+    Ok(tauri::ipc::Response::new(session.preview_rgba.clone()))
 }
 
 // ─────────────────────────── 测试 ───────────────────────────
@@ -524,7 +589,8 @@ mod tests {
             preview_max_size: 4096,
             tileable: true,
             raw_preview: false,
-            preview_webp: vec![],
+            preview_rgba: vec![],
+            nav_preview_webp: vec![],
         })
     }
 
@@ -711,14 +777,16 @@ mod tests {
         f.flush().unwrap();
 
         let start = std::time::Instant::now();
-        let preview = generate_bmp_preview(f.path(), 4096, 4).unwrap();
+        let (preview, pw, ph) = generate_bmp_preview(f.path(), 4096, 4).unwrap();
         let preview_ms = start.elapsed().as_millis();
         println!(
-            "Preview 生成耗时: {preview_ms}ms，大小: {}KB",
+            "Preview 生成耗时: {preview_ms}ms，{}×{}，大小: {}KB",
+            pw,
+            ph,
             preview.len() / 1024
         );
         assert!(preview_ms < 3000, "预览生成超时: {preview_ms}ms");
-        assert_eq!(&preview[0..4], b"RIFF");
+        assert_eq!(preview.len(), pw as usize * ph as usize * 4);
 
         // 验证瓦片
         let tile = generate_bmp_tile(f.path(), 0, 0, 512, width, height).unwrap();
@@ -735,7 +803,7 @@ mod tests {
 
         let reader = BmpReader::open(&path).unwrap();
         let preview_start = std::time::Instant::now();
-        let preview = generate_bmp_preview(&path, 4096, 4).unwrap();
+        let (preview, pw, ph) = generate_bmp_preview(&path, 4096, 4).unwrap();
         let preview_ms = preview_start.elapsed().as_millis();
 
         let tile_start = std::time::Instant::now();
@@ -743,7 +811,7 @@ mod tests {
             generate_bmp_tile(&path, 0, 0, 512, reader.info.width, reader.info.height).unwrap();
         let tile_ms = tile_start.elapsed().as_millis();
 
-        assert_eq!(&preview[0..4], b"RIFF");
+        assert_eq!(preview.len(), pw as usize * ph as usize * 4);
         assert_eq!(&tile[0..4], b"RIFF");
         println!(
             "Workspace BMP {}×{}: preview={}KB/{}ms, tile={}KB/{}ms",

@@ -24,7 +24,7 @@ import { storeToRefs } from 'pinia'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import type { LargeImageSession } from '@/types/image'
-import { previewUrl, tileUrl } from '@/utils/largeImageUrl'
+import { tileUrl } from '@/utils/largeImageUrl'
 
 // ─── Props ────────────────────────────────────────────────────────
 const props = defineProps<{
@@ -40,7 +40,7 @@ const { zoom, offset, rotation, viewport } = storeToRefs(viewerStore)
 const canvasRef = useTemplateRef<HTMLCanvasElement>('canvas')
 
 // ─── Preview image ────────────────────────────────────────────────
-const previewImg = shallowRef<HTMLImageElement | null>(null)
+const previewImg = shallowRef<ImageBitmap | null>(null)
 const previewLoaded = shallowRef(false)
 
 // ─── Tile LRU cache ───────────────────────────────────────────────
@@ -69,12 +69,12 @@ let firstTileReported = false // 防止重复上报首屏 tile 数
 
 /**
  * 计算当前 session 的 previewScale：
- * previewMaxSize / max(width, height)
+ * 实际预览像素宽 / 图像宽（等价于预览缩放比）。
  * zoom 超过此值时 preview 不够清晰，需要 tile 补充。
  */
 function computePreviewScale(): number {
-  const { width, height, previewMaxSize } = props.session
-  return previewMaxSize / Math.max(width, height)
+  const { width, previewW } = props.session
+  return width > 0 ? previewW / width : 1
 }
 
 /**
@@ -301,23 +301,31 @@ function render() {
 // ─── Preview 加载 ─────────────────────────────────────────────────
 
 function loadPreview() {
-  const { sessionId } = props.session
-  const url = previewUrl(sessionId)
-  const img = new Image()
-  inflightImages.add(img)
-  img.src = url
-  img.onload = () => {
-    inflightImages.delete(img)
-    if (props.session.sessionId !== sessionId) return
-    previewImg.value = img
-    previewLoaded.value = true
-    scheduleRender()
-    if (import.meta.env.DEV) console.log(`[PicSee] preview loaded: session=${sessionId}`)
-  }
-  img.onerror = () => {
-    inflightImages.delete(img)
-    console.warn(`[PicSee] preview load error: session=${sessionId}`)
-  }
+  const { sessionId, previewW, previewH } = props.session
+  void (async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const buf = await invoke<ArrayBuffer>('get_preview', { sessionId })
+      if (props.session.sessionId !== sessionId) return
+      const expected = previewW * previewH * 4
+      if (!previewW || !previewH || buf.byteLength < expected) {
+        throw new Error(`bad preview: bytes=${buf.byteLength} expected=${expected} ${previewW}×${previewH}`)
+      }
+      const data = new Uint8ClampedArray(buf, 0, expected)
+      const bitmap = await createImageBitmap(new ImageData(data, previewW, previewH))
+      if (props.session.sessionId !== sessionId) {
+        bitmap.close()
+        return
+      }
+      previewImg.value?.close()
+      previewImg.value = bitmap
+      previewLoaded.value = true
+      scheduleRender()
+      if (import.meta.env.DEV) console.log(`[PicSee] preview(raw) loaded: session=${sessionId} ${previewW}×${previewH}`)
+    } catch (e) {
+      console.warn(`[PicSee] preview load error: session=${sessionId}`, e)
+    }
+  })()
 }
 
 // ─── 生命周期 & 响应式 ────────────────────────────────────────────
@@ -332,6 +340,7 @@ watch(() => props.session, (newSession, oldSession) => {
   if (newSession.sessionId !== oldSession?.sessionId) {
     cancelInflightImages()
     previewLoaded.value = false
+    previewImg.value?.close()
     previewImg.value = null
     tileCache.clear()
     loadingTiles.clear()
@@ -364,6 +373,7 @@ onBeforeUnmount(() => {
   loadingTiles.clear()
   failedTiles.clear()
   cancelInflightImages()
+  previewImg.value?.close()
 })
 </script>
 
