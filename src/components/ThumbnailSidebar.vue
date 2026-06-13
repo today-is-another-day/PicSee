@@ -392,11 +392,16 @@ function getErrorI18n(path: string): string {
   flex: 0 0 auto;
   flex-direction: row;
   align-items: center;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-top: 1px solid var(--border-color);
   border-right: 0;
   overflow-x: auto;
   overflow-y: hidden;
+}
+
+/* 横向栏：缩小缩略图与文件名的纵向间距，压低整体栏高 */
+.thumbnail-sidebar--horizontal .thumbnail-sidebar__item {
+  gap: 4px;
 }
 
 /* ─── 标题 ────────────────────────────────────────────────────────────── */

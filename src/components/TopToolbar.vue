@@ -19,7 +19,6 @@ const viewerStore = useViewerStore()
       <span class="top-toolbar__logo">P</span>
       <div>
         <strong>{{ t('app.name') }}</strong>
-        <span>{{ t('app.subtitle') }}</span>
       </div>
     </div>
     <div class="top-toolbar__actions">

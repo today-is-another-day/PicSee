@@ -50,10 +50,10 @@ function formatFileSize(bytes?: number) {
 <style scoped>
 .status-bar {
   display: flex;
-  min-height: 30px;
+  min-height: 24px;
   align-items: center;
   gap: 18px;
-  padding: 4px 14px;
+  padding: 2px 14px;
   border-top: 1px solid var(--border-color);
   background: var(--panel-bg);
   color: var(--muted-color);

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, toRaw, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -12,12 +12,12 @@ const { t } = useI18n()
 const appStore = useAppStore()
 const settingsStore = useSettingsStore()
 const { settings, saving } = storeToRefs(settingsStore)
-const draft = ref<AppSettings>(structuredClone(settings.value))
+const draft = ref<AppSettings>(structuredClone(toRaw(settings.value)))
 
 watch(
   () => appStore.settingsVisible,
   () => {
-    draft.value = structuredClone(settings.value)
+    draft.value = structuredClone(toRaw(settings.value))
   },
 )
 

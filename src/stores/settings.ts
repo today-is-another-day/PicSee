@@ -1,4 +1,4 @@
-import { computed, ref, shallowRef } from 'vue'
+import { computed, ref, shallowRef, toRaw } from 'vue'
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -44,14 +44,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   layout: {
     showThumbnailBar: true,
     thumbnailPosition: 'bottom',
-    thumbnailSize: 160,
+    thumbnailSize: 96,
     showStatusBar: true,
     compactMode: false,
   },
 }
 
 function cloneSettings(settings: AppSettings): AppSettings {
-  return structuredClone(settings)
+  return structuredClone(toRaw(settings))
 }
 
 function isTauriRuntime(): boolean {
