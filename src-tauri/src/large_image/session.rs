@@ -317,11 +317,15 @@ fn decode_profiled_image(path: &Path) -> Result<image::DynamicImage, LargeImageE
         .into_decoder()
         .map_err(|e| LargeImageError::decode(format!("创建图像解码器失败: {e}")))?;
     let icc = decoder.icc_profile().unwrap_or(None);
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = image::DynamicImage::from_decoder(decoder)
         .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
     if let Some(icc) = icc {
         img = color::dynamic_image_to_srgb(img, &icc);
     }
+    img.apply_orientation(orientation);
     Ok(img)
 }
 
@@ -802,6 +806,33 @@ mod tests {
     #[allow(unused_imports)]
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn make_orientation_6_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::new_rgb8(width, height);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .unwrap();
+        let encoded = encoded.into_inner();
+
+        // JPEG APP1：Exif header + little-endian TIFF，Orientation(0x0112)=6。
+        let app1 = [
+            0xff, 0xe1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0x00, 0x00, b'I', b'I', 0x2a, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        [&encoded[..2], &app1, &encoded[2..]].concat()
+    }
+
+    #[test]
+    fn test_decode_profiled_image_applies_exif_orientation() {
+        let mut file = NamedTempFile::with_suffix(".jpg").unwrap();
+        file.write_all(&make_orientation_6_jpeg(8, 4)).unwrap();
+
+        let decoded = decode_profiled_image(file.path()).unwrap();
+
+        assert_eq!((decoded.width(), decoded.height()), (4, 8));
+    }
 
     // ── scale_to_fit_correct ──
 
