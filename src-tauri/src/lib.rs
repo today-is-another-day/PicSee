@@ -13,7 +13,7 @@ use large_image::session::{close_large_image, get_preview, open_large_image, Lar
 use settings::{get_settings, read_settings_file, save_settings};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
-use thumbnails::{clear_thumbnail_cache, get_thumbnail, ThumbnailState};
+use thumbnails::{clear_thumbnail_cache, enforce_disk_cache_limit, get_thumbnail, ThumbnailState};
 
 #[derive(Default)]
 struct PendingOpenPaths(Mutex<Vec<String>>);
@@ -196,6 +196,14 @@ pub fn run() {
                     .allow_directory(&thumb_dir, false);
                 // 清理上次遗留的大图临时栅格（非 BMP 大图分块用）
                 let _ = std::fs::remove_dir_all(cache_dir.join("large-raster"));
+                // 启动后在后台按磁盘缓存水位淘汰旧缩略图，不阻塞应用初始化。
+                let disk_cache_limit_bytes = settings
+                    .cache
+                    .disk_cache_limit_mb
+                    .saturating_mul(1024 * 1024);
+                tauri::async_runtime::spawn_blocking(move || {
+                    enforce_disk_cache_limit(&thumb_dir, disk_cache_limit_bytes)
+                });
             }
 
             Ok(())

@@ -7,10 +7,15 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{AppHandle, Manager};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::settings::read_settings_file;
 
 /// Supported thumbnail format extensions (lowercase).
 const THUMBNAIL_EXTENSIONS: [&str; 18] = [
@@ -24,6 +29,8 @@ const MAX_SIDE_PIXELS: u32 = 12_000;
 const MAX_INPROC_PIXELS: u64 = 40_000_000;
 /// 文件大小硬上限（防御病态超大文件；常规大图由 sips 降采样处理）。
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB
+/// 长会话每新增约 64MB 缩略图后触发一次后台容量检查，避免每次写盘都扫描目录。
+const DISK_CACHE_SWEEP_WRITE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Structured error for frontend i18n mapping by code.
 #[derive(Debug, Serialize)]
@@ -75,6 +82,8 @@ pub struct ThumbnailState {
     semaphore: Arc<Semaphore>,
     /// in-flight map: cache_key → watch sender, merges concurrent requests for the same file.
     in_flight: Mutex<HashMap<String, InFlightSender>>,
+    /// 上次容量检查后新增的缩略图字节数。
+    bytes_since_disk_cache_sweep: AtomicU64,
 }
 
 impl ThumbnailState {
@@ -82,7 +91,25 @@ impl ThumbnailState {
         Self {
             semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             in_flight: Mutex::new(HashMap::new()),
+            bytes_since_disk_cache_sweep: AtomicU64::new(0),
         }
+    }
+
+    /// 累计本次写盘大小；跨过阈值时仅允许一个调用方触发后台扫描。
+    fn record_disk_cache_write(&self, bytes: u64) -> bool {
+        let total = self
+            .bytes_since_disk_cache_sweep
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if total < DISK_CACHE_SWEEP_WRITE_THRESHOLD_BYTES {
+            return false;
+        }
+
+        self.bytes_since_disk_cache_sweep
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                (current >= DISK_CACHE_SWEEP_WRITE_THRESHOLD_BYTES).then_some(0)
+            })
+            .is_ok()
     }
 }
 
@@ -251,6 +278,17 @@ pub async fn get_thumbnail(
     match result {
         Ok(out_path) => {
             ensure_cache_scope(&app, &cache_dir)?;
+            if fs::metadata(&out_path)
+                .map(|metadata| state.record_disk_cache_write(metadata.len()))
+                .unwrap_or(false)
+            {
+                let settings_path = app
+                    .path()
+                    .app_config_dir()
+                    .ok()
+                    .map(|directory| directory.join("settings.json"));
+                spawn_disk_cache_sweep(cache_dir, settings_path);
+            }
             Ok(out_path.to_string_lossy().into_owned())
         }
         Err(gen_err) => Err(gen_err.into_thumbnail_error()),
@@ -316,6 +354,68 @@ pub fn compute_cache_key(
     // Take first 16 bytes (128 bits) → 32 hex chars.
     let bytes: &[u8] = &digest[..16];
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 按文件 mtime 从旧到新淘汰缩略图缓存；超过 90% 时清理到 70%。
+pub(crate) fn enforce_disk_cache_limit(cache_dir: &Path, limit_bytes: u64) -> u64 {
+    if limit_bytes == 0 {
+        return 0;
+    }
+
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let size = metadata.len();
+        total = total.saturating_add(size);
+        files.push((
+            entry.path(),
+            size,
+            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        ));
+    }
+
+    let high = limit_bytes.saturating_mul(90) / 100;
+    if total <= high {
+        return 0;
+    }
+    let low = limit_bytes.saturating_mul(70) / 100;
+    files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut freed = 0u64;
+    for (path, size, _) in files {
+        if total <= low {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(size);
+            freed = freed.saturating_add(size);
+        }
+    }
+    freed
+}
+
+/// 长会话后台检查：每次触发时重新读取磁盘缓存上限，以响应运行期间的设置变化。
+fn spawn_disk_cache_sweep(cache_dir: PathBuf, settings_path: Option<PathBuf>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = settings_path
+            .as_deref()
+            .and_then(|path| read_settings_file(path).ok())
+            .unwrap_or_default();
+        let limit_bytes = settings
+            .cache
+            .disk_cache_limit_mb
+            .saturating_mul(1024 * 1024);
+        enforce_disk_cache_limit(&cache_dir, limit_bytes)
+    });
 }
 
 /// Generate a thumbnail and write it to disk; returns the cache file path.
@@ -490,6 +590,7 @@ fn ensure_cache_scope(app: &AppHandle, cache_dir: &Path) -> Result<(), Thumbnail
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::{set_file_mtime, FileTime};
     use image::GenericImageView;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -505,6 +606,57 @@ mod tests {
             .write_to(&mut buf, ImageFormat::Jpeg)
             .expect("JPEG encoding should succeed");
         buf.into_inner()
+    }
+
+    fn write_cache_file(cache_dir: &Path, name: &str, size: usize, mtime_seconds: i64) {
+        let path = cache_dir.join(name);
+        fs::write(&path, vec![0u8; size]).unwrap();
+        set_file_mtime(path, FileTime::from_unix_time(mtime_seconds, 0)).unwrap();
+    }
+
+    #[test]
+    fn test_enforce_disk_cache_limit_deletes_oldest_to_low_watermark() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        write_cache_file(cache_dir.path(), "oldest.webp", 30, 1);
+        write_cache_file(cache_dir.path(), "older.webp", 30, 2);
+        write_cache_file(cache_dir.path(), "newer.webp", 30, 3);
+        write_cache_file(cache_dir.path(), "newest.webp", 30, 4);
+
+        let freed = enforce_disk_cache_limit(cache_dir.path(), 100);
+
+        assert_eq!(freed, 60);
+        assert!(!cache_dir.path().join("oldest.webp").exists());
+        assert!(!cache_dir.path().join("older.webp").exists());
+        assert!(cache_dir.path().join("newer.webp").exists());
+        assert!(cache_dir.path().join("newest.webp").exists());
+    }
+
+    #[test]
+    fn test_enforce_disk_cache_limit_does_nothing_below_high_watermark() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        write_cache_file(cache_dir.path(), "old.webp", 40, 1);
+        write_cache_file(cache_dir.path(), "new.webp", 50, 2);
+
+        assert_eq!(enforce_disk_cache_limit(cache_dir.path(), 100), 0);
+        assert!(cache_dir.path().join("old.webp").exists());
+        assert!(cache_dir.path().join("new.webp").exists());
+    }
+
+    #[test]
+    fn test_enforce_disk_cache_limit_zero_is_unlimited() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        write_cache_file(cache_dir.path(), "cached.webp", 100, 1);
+
+        assert_eq!(enforce_disk_cache_limit(cache_dir.path(), 0), 0);
+        assert!(cache_dir.path().join("cached.webp").exists());
+    }
+
+    #[test]
+    fn test_thumbnail_state_triggers_sweep_after_write_threshold() {
+        let state = ThumbnailState::new(1);
+        assert!(!state.record_disk_cache_write(DISK_CACHE_SWEEP_WRITE_THRESHOLD_BYTES - 1));
+        assert!(state.record_disk_cache_write(1));
+        assert!(!state.record_disk_cache_write(1));
     }
 
     #[test]

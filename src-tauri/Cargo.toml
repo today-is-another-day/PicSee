@@ -27,4 +27,5 @@ lru = "0.12"
 webp = "0.3"
 
 [dev-dependencies]
+filetime = "0.2.29"
 tempfile = "3"
