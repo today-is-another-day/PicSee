@@ -30,6 +30,13 @@ const PREVIEW_RAW_CAP: u32 = 2048;
 /// 导航窗预览最长边上限（小图，供 NavigatorOverlay 的 <img> 显示）。
 const NAV_PREVIEW_CAP: u32 = 384;
 
+/// 非 BMP 大图落临时栅格的像素上限：超过则退化为仅预览，避免一次性解码 OOM。
+/// 100M 像素 ≈ 解码峰值数百 MB，权衡内存预算与可视化收益。
+const MAX_RASTER_PIXELS: u64 = 100_000_000;
+
+/// 临时栅格文件序号（保证文件名唯一）。
+static RASTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 单个大图会话。
 #[derive(Debug)]
 pub struct ImageSession {
@@ -42,6 +49,10 @@ pub struct ImageSession {
     /// 是否支持原始分辨率瓦片读取；M4 仅支持 24/32-bit BI_RGB BMP。
     pub tileable: bool,
     pub raw_preview: bool,
+    /// 瓦片读取的源文件：BMP 为原文件，非 BMP 为解码后落盘的临时 32-bit BMP 栅格。
+    pub tile_source_path: std::path::PathBuf,
+    /// tile_source_path 是否为本引擎生成的临时栅格（会话关闭时删除）。
+    pub tile_source_is_temp: bool,
     /// 预览图原始 RGBA 字节（不编码，前端用 ImageData 渲染，避免 WebP 编码耗时）。
     /// 像素尺寸通过 OpenLargeImageResult.preview_w/h 告知前端。
     pub preview_rgba: Vec<u8>,
@@ -90,20 +101,32 @@ impl LargeImageState {
             .cloned()
     }
 
-    /// 添加会话；超过 2 个时逐出最旧的。
-    pub fn add_session(&mut self, session: Arc<ImageSession>) {
+    /// 添加会话；超过 2 个时逐出最旧的。返回被逐出会话的临时栅格路径（供调用方删除）。
+    pub fn add_session(&mut self, session: Arc<ImageSession>) -> Vec<std::path::PathBuf> {
+        let mut evicted_temps = Vec::new();
         while self.sessions.len() >= 2 {
             if let Some(evicted) = self.sessions.pop_front() {
                 self.clear_session_tiles(evicted.session_id);
+                if evicted.tile_source_is_temp {
+                    evicted_temps.push(evicted.tile_source_path.clone());
+                }
             }
         }
         self.sessions.push_back(session);
+        evicted_temps
     }
 
-    /// 移除指定 session_id 的会话。
-    pub fn remove_session(&mut self, session_id: u64) {
+    /// 移除指定 session_id 的会话。返回其临时栅格路径（若有，供调用方删除）。
+    pub fn remove_session(&mut self, session_id: u64) -> Option<std::path::PathBuf> {
+        let temp = self
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+            .filter(|s| s.tile_source_is_temp)
+            .map(|s| s.tile_source_path.clone());
         self.sessions.retain(|s| s.session_id != session_id);
         self.clear_session_tiles(session_id);
+        temp
     }
 
     /// 生成并消费下一个会话 ID。
@@ -306,6 +329,59 @@ pub fn make_nav_preview(preview_rgba: &[u8], pw: u32, ph: u32) -> Result<Vec<u8>
     encode_rgba_to_webp(&small, nw, nh, 80.0)
 }
 
+/// 把 RGBA 缓冲写成 32-bit top-down BI_RGB BMP 临时文件，供 `BmpReader` 区域分块复用。
+/// 行式写入，内存只多一个行缓冲（不复制整图）。
+fn write_temp_bmp_raster(rgba: &[u8], w: u32, h: u32, dst: &Path) -> Result<(), LargeImageError> {
+    use std::io::{BufWriter, Write};
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LargeImageError::io(format!("创建栅格目录失败: {e}")))?;
+    }
+    let row_bytes = w as usize * 4;
+    let pixel_bytes = row_bytes * h as usize;
+    let file_size = 54u32.saturating_add(pixel_bytes as u32);
+
+    let file =
+        std::fs::File::create(dst).map_err(|e| LargeImageError::io(format!("创建栅格失败: {e}")))?;
+    let mut writer = BufWriter::new(file);
+
+    // BITMAPINFOHEADER（54 字节）：32-bit、top-down（高度取负）、BI_RGB。
+    let mut hdr = [0u8; 54];
+    hdr[0] = b'B';
+    hdr[1] = b'M';
+    hdr[2..6].copy_from_slice(&file_size.to_le_bytes());
+    hdr[10..14].copy_from_slice(&54u32.to_le_bytes());
+    hdr[14..18].copy_from_slice(&40u32.to_le_bytes());
+    hdr[18..22].copy_from_slice(&(w as i32).to_le_bytes());
+    hdr[22..26].copy_from_slice(&(-(h as i32)).to_le_bytes());
+    hdr[26..28].copy_from_slice(&1u16.to_le_bytes());
+    hdr[28..30].copy_from_slice(&32u16.to_le_bytes());
+    hdr[30..34].copy_from_slice(&0u32.to_le_bytes());
+    writer
+        .write_all(&hdr)
+        .map_err(|e| LargeImageError::io(format!("写栅格头失败: {e}")))?;
+
+    // 像素：RGBA → BGRA，逐行写（top-down，行 0 在前）。
+    let mut row = vec![0u8; row_bytes];
+    for y in 0..h as usize {
+        let src = &rgba[y * row_bytes..y * row_bytes + row_bytes];
+        for x in 0..w as usize {
+            let s = x * 4;
+            row[s] = src[s + 2];
+            row[s + 1] = src[s + 1];
+            row[s + 2] = src[s];
+            row[s + 3] = src[s + 3];
+        }
+        writer
+            .write_all(&row)
+            .map_err(|e| LargeImageError::io(format!("写栅格行失败: {e}")))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| LargeImageError::io(format!("flush 栅格失败: {e}")))?;
+    Ok(())
+}
+
 /// 处理 picsee://localhost/preview/{session_id} 请求（返回导航窗小 WebP）。
 pub fn handle_preview_request(
     state: &Mutex<LargeImageState>,
@@ -348,7 +424,7 @@ pub fn handle_tile_request(
             return Err((415, LargeImageError::tiles_unavailable()));
         }
         (
-            session.path.clone(),
+            session.tile_source_path.clone(),
             session.tile_size,
             session.width,
             session.height,
@@ -378,6 +454,19 @@ pub fn handle_tile_request(
 }
 
 // ─────────────────────────── Commands ───────────────────────────
+
+/// `open_large_image` 解码阶段（spawn_blocking 内）的产出。
+struct PreparedImage {
+    width: u32,
+    height: u32,
+    preview_rgba: Vec<u8>,
+    preview_w: u32,
+    preview_h: u32,
+    tileable: bool,
+    raw_preview: bool,
+    tile_source_path: std::path::PathBuf,
+    tile_source_is_temp: bool,
+}
 
 /// 打开大图，创建会话，返回会话信息。
 #[tauri::command]
@@ -409,6 +498,11 @@ pub async fn open_large_image(
         .app_cache_dir()
         .ok()
         .map(|directory| directory.join("system-decode"));
+    let large_raster_dir = app
+        .path()
+        .app_cache_dir()
+        .ok()
+        .map(|directory| directory.join("large-raster"));
 
     let path_buf = std::path::PathBuf::from(&path);
     let ext = path_buf
@@ -417,63 +511,114 @@ pub async fn open_large_image(
         .unwrap_or("")
         .to_lowercase();
 
-    // spawn_blocking：解析 header + 生成 preview
+    // spawn_blocking：解码 + 生成预览（非 BMP 大图顺带落临时栅格供分块）
     let path_clone = path_buf.clone();
     #[cfg(debug_assertions)]
     let open_start = std::time::Instant::now();
-    let (width, height, preview_rgba, preview_w, preview_h, tileable, raw_preview) =
-        tokio::task::spawn_blocking(move || {
-            let (w, h, tileable, raw_preview) = if ext == "bmp" {
-                use crate::large_image::bmp::BmpInfo;
-                let info = BmpInfo::from_file(&path_clone)?;
-                (info.width, info.height, true, false)
-            } else if extended_formats::is_system_decoded(&path_clone) {
-                let decoded = extended_formats::decode_system_image_in(
-                    &path_clone,
-                    system_decode_dir.as_deref(),
-                )
-                .map_err(LargeImageError::from_system_decode)?;
-                let (w, h) = (decoded.width(), decoded.height());
-                let preview_limit = if extended_formats::is_tiff(&path_clone)
-                    && w as u64 * (h as u64) < settings.large_image.pixel_threshold
-                {
-                    w.max(h)
-                } else {
-                    preview_max_size
-                }
-                .min(PREVIEW_RAW_CAP);
-                let thumb = decoded.thumbnail(preview_limit, preview_limit).to_rgba8();
-                let (tw, th) = (thumb.width(), thumb.height());
-                return Ok::<_, LargeImageError>((
-                    w,
-                    h,
-                    thumb.into_raw(),
-                    tw,
-                    th,
-                    false,
-                    extended_formats::is_raw(&path_clone),
-                ));
-            } else {
-                let reader = image::ImageReader::open(&path_clone)
-                    .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
-                    .with_guessed_format()
-                    .map_err(|e| LargeImageError::io(format!("猜测格式失败: {e}")))?;
-                let (w, h) = reader
-                    .into_dimensions()
-                    .map_err(|e| LargeImageError::decode(format!("读取尺寸失败: {e}")))?;
-                (w, h, false, false)
-            };
+    let PreparedImage {
+        width,
+        height,
+        preview_rgba,
+        preview_w,
+        preview_h,
+        tileable,
+        raw_preview,
+        tile_source_path,
+        tile_source_is_temp,
+    } = tokio::task::spawn_blocking(move || -> Result<PreparedImage, LargeImageError> {
+        if ext == "bmp" {
+            use crate::large_image::bmp::BmpInfo;
+            let info = BmpInfo::from_file(&path_clone)?;
+            let (preview, pw, ph) = generate_bmp_preview(&path_clone, preview_max_size, cpu_threads)?;
+            return Ok(PreparedImage {
+                width: info.width,
+                height: info.height,
+                preview_rgba: preview,
+                preview_w: pw,
+                preview_h: ph,
+                tileable: true,
+                raw_preview: false,
+                tile_source_path: path_clone,
+                tile_source_is_temp: false,
+            });
+        }
 
-            let (preview, pw, ph) = if ext == "bmp" {
-                generate_bmp_preview(&path_clone, preview_max_size, cpu_threads)?
+        if extended_formats::is_system_decoded(&path_clone) {
+            let decoded =
+                extended_formats::decode_system_image_in(&path_clone, system_decode_dir.as_deref())
+                    .map_err(LargeImageError::from_system_decode)?;
+            let (w, h) = (decoded.width(), decoded.height());
+            let preview_limit = if extended_formats::is_tiff(&path_clone)
+                && w as u64 * (h as u64) < settings.large_image.pixel_threshold
+            {
+                w.max(h)
             } else {
-                generate_generic_preview(&path_clone, preview_max_size)?
-            };
+                preview_max_size
+            }
+            .min(PREVIEW_RAW_CAP);
+            let thumb = decoded.thumbnail(preview_limit, preview_limit).to_rgba8();
+            let (tw, th) = (thumb.width(), thumb.height());
+            return Ok(PreparedImage {
+                width: w,
+                height: h,
+                preview_rgba: thumb.into_raw(),
+                preview_w: tw,
+                preview_h: th,
+                tileable: false,
+                raw_preview: extended_formats::is_raw(&path_clone),
+                tile_source_path: path_clone,
+                tile_source_is_temp: false,
+            });
+        }
 
-            Ok::<_, LargeImageError>((w, h, preview, pw, ph, tileable, raw_preview))
+        // 非 BMP 普通格式（PNG/JPEG/WebP…）：解码一次 → 预览 + 临时 32-bit BMP 栅格（供分块）。
+        let img = image::open(&path_clone)
+            .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
+        let (w, h) = (img.width(), img.height());
+        let cap = preview_max_size.min(PREVIEW_RAW_CAP);
+        let (req_w, req_h) = scale_to_fit_correct(w, h, cap);
+        // thumbnail 保持纵横比，实际尺寸可能 ≠ (req_w, req_h)，必须用实际尺寸告知前端。
+        let thumb = img.thumbnail(req_w, req_h).to_rgba8();
+        let (pw, ph) = (thumb.width(), thumb.height());
+        let preview = thumb.into_raw();
+        let pixels = w as u64 * h as u64;
+
+        // 像素在上限内且有缓存目录：落临时栅格，启用清晰分块。
+        if pixels <= MAX_RASTER_PIXELS {
+            if let Some(dir) = large_raster_dir.as_deref() {
+                let seq = RASTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let raster = dir.join(format!("raster-{seq}.bmp"));
+                let rgba = img.into_rgba8();
+                write_temp_bmp_raster(rgba.as_raw(), w, h, &raster)?;
+                return Ok(PreparedImage {
+                    width: w,
+                    height: h,
+                    preview_rgba: preview,
+                    preview_w: pw,
+                    preview_h: ph,
+                    tileable: true,
+                    raw_preview: false,
+                    tile_source_path: raster,
+                    tile_source_is_temp: true,
+                });
+            }
+        }
+
+        // 像素过大或无缓存目录：仅预览（放大会糊，但内存安全）。
+        Ok(PreparedImage {
+            width: w,
+            height: h,
+            preview_rgba: preview,
+            preview_w: pw,
+            preview_h: ph,
+            tileable: false,
+            raw_preview: false,
+            tile_source_path: path_clone,
+            tile_source_is_temp: false,
         })
-        .await
-        .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))??;
+    })
+    .await
+    .map_err(|e| LargeImageError::io(format!("spawn_blocking 失败: {e}")))??;
 
     #[cfg(debug_assertions)]
     println!(
@@ -499,6 +644,8 @@ pub async fn open_large_image(
         preview_max_size,
         tileable,
         raw_preview,
+        tile_source_path,
+        tile_source_is_temp,
         preview_rgba,
         nav_preview_webp,
     });
@@ -513,7 +660,11 @@ pub async fn open_large_image(
         preview_w,
         preview_h,
     };
-    guard.add_session(session);
+    let evicted_temps = guard.add_session(session);
+    drop(guard);
+    for temp in evicted_temps {
+        let _ = std::fs::remove_file(temp);
+    }
 
     Ok(result)
 }
@@ -522,8 +673,13 @@ pub async fn open_large_image(
 #[tauri::command]
 pub async fn close_large_image(app: AppHandle, session_id: u64) -> Result<(), LargeImageError> {
     let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
-    let mut guard = state_arc.lock().unwrap();
-    guard.remove_session(session_id);
+    let temp = {
+        let mut guard = state_arc.lock().unwrap();
+        guard.remove_session(session_id)
+    };
+    if let Some(temp) = temp {
+        let _ = std::fs::remove_file(temp);
+    }
     Ok(())
 }
 
@@ -589,6 +745,8 @@ mod tests {
             preview_max_size: 4096,
             tileable: true,
             raw_preview: false,
+            tile_source_path: std::path::PathBuf::from("/tmp/test.bmp"),
+            tile_source_is_temp: false,
             preview_rgba: vec![],
             nav_preview_webp: vec![],
         })
@@ -703,6 +861,30 @@ mod tests {
         // 验证 RIFF 头
         assert!(result.len() >= 4);
         assert_eq!(&result[0..4], b"RIFF");
+    }
+
+    #[test]
+    fn test_temp_bmp_raster_roundtrip() {
+        // 写 RGBA → 临时 32-bit BMP → BmpReader 读回，须逐字节一致（top-down 顺序、RGBA 通道）。
+        use crate::large_image::bmp::{BmpReader, Rect};
+        let (w, h) = (4u32, 3u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for i in 0..(w * h) as usize {
+            rgba[i * 4] = (i * 10) as u8;
+            rgba[i * 4 + 1] = (i * 10 + 1) as u8;
+            rgba[i * 4 + 2] = (i * 10 + 2) as u8;
+            rgba[i * 4 + 3] = 255;
+        }
+        let f = NamedTempFile::with_suffix(".bmp").unwrap();
+        write_temp_bmp_raster(&rgba, w, h, f.path()).unwrap();
+
+        let reader = BmpReader::open(f.path()).unwrap();
+        assert_eq!(reader.info.width, w);
+        assert_eq!(reader.info.height, h);
+        let back = reader
+            .read_region(Rect { x: 0, y: 0, width: w, height: h }, w, h)
+            .unwrap();
+        assert_eq!(back, rgba, "栅格往返 RGBA 必须一致");
     }
 
     // ── 基准测试（#[ignore]）──

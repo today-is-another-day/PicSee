@@ -193,6 +193,8 @@ pub fn run() {
                 let _ = app
                     .asset_protocol_scope()
                     .allow_directory(&thumb_dir, false);
+                // 清理上次遗留的大图临时栅格（非 BMP 大图分块用）
+                let _ = std::fs::remove_dir_all(cache_dir.join("large-raster"));
             }
 
             Ok(())
