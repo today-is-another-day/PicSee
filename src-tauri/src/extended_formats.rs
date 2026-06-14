@@ -79,6 +79,40 @@ pub fn decode_system_image(path: &Path) -> Result<DynamicImage, String> {
     decode_system_image_in(path, None)
 }
 
+/// 用 sips 子进程把任意大图降采样为最长边 ≤ `max_side` 的临时 PNG，再交给 image-rs。
+///
+/// 关键价值：解码在 sips 进程内完成（内存隔离），本进程只读取降采样后的小图，
+/// 避免对超大图（> 1 亿像素 / 超长边）在本进程整图解码导致 OOM。
+pub fn downscale_with_sips_in(
+    path: &Path,
+    max_side: u32,
+    preferred_directory: Option<&Path>,
+) -> Result<DynamicImage, String> {
+    let directory = runtime_decode_directory(preferred_directory)?;
+    let output = temporary_png_path(&directory);
+    let mut command = Command::new("sips");
+    command
+        .args(["-s", "format", "png"])
+        .args(["-Z", &max_side.to_string()])
+        .arg(path)
+        .args(["--out"])
+        .arg(&output);
+
+    let result = run_command_with_timeout(&mut command, SIPS_TIMEOUT);
+    let decoded = match result {
+        Ok(result) if result.status.success() => {
+            image::open(&output).map_err(|error| format!("读取降采样 PNG 失败: {error}"))
+        }
+        Ok(result) => Err(format!(
+            "sips 降采样失败: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(&output);
+    decoded
+}
+
 /// 仅通过 sips 元数据读取尺寸，不生成临时 PNG、不全量解码。
 pub fn probe_system_image(path: &Path) -> Result<(u32, u32), String> {
     let mut command = Command::new("sips");

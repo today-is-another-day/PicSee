@@ -18,9 +18,12 @@ const THUMBNAIL_EXTENSIONS: [&str; 18] = [
     "nef", "arw", "raf", "orf", "rw2",
 ];
 
-/// Skip thumbnail when either side exceeds this pixel count or file exceeds MAX_FILE_BYTES.
+/// 超过此单边像素或 MAX_INPROC_PIXELS 时改用 sips 子进程降采样（内存隔离），不在本进程整图解码。
 const MAX_SIDE_PIXELS: u32 = 12_000;
-const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+/// 本进程整图解码的像素上限；超过改走 sips（避免大图缩略图占用过多内存）。
+const MAX_INPROC_PIXELS: u64 = 40_000_000;
+/// 文件大小硬上限（防御病态超大文件；常规大图由 sips 降采样处理）。
+const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB
 
 /// Structured error for frontend i18n mapping by code.
 #[derive(Debug, Serialize)]
@@ -333,47 +336,51 @@ pub fn generate_thumbnail(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // 解码前仅读 header，避免系统格式和普通格式因异常尺寸耗尽内存。
-    if extended_formats::is_system_decoded(path) {
-        let (w, h) = extended_formats::probe_system_image(path).map_err(|error| {
+    let system_decode_dir = cache_dir
+        .parent()
+        .map(|directory| directory.join("system-decode"));
+
+    // 1. 仅读 header 取尺寸（系统格式 sips 元数据；普通格式 image-rs header）。
+    let (w, h) = if extended_formats::is_system_decoded(path) {
+        extended_formats::probe_system_image(path).map_err(|error| {
             if error.starts_with("IMAGE_TOO_LARGE:") {
+                // 系统格式（TIFF/HEIC/RAW）超限暂仍跳过；常规大图为非系统格式，走下方 sips 降采样。
                 GenError::ImageTooLarge
             } else {
                 GenError::DecodeFailed(error)
             }
-        })?;
-        if w > MAX_SIDE_PIXELS || h > MAX_SIDE_PIXELS {
-            return Err(GenError::ImageTooLarge);
-        }
+        })?
     } else {
         let reader = ImageReader::open(path)
             .map_err(|e| GenError::IoFailed(format!("Failed to open image file: {e}")))?
             .with_guessed_format()
             .map_err(|e| GenError::IoFailed(format!("Failed to guess image format: {e}")))?;
-        // into_dimensions() reads only the header, avoiding full decode.
-        let (w, h) = reader
+        // into_dimensions() 仅读 header，不整图解码。
+        reader
             .into_dimensions()
-            .map_err(|e| GenError::DecodeFailed(format!("Failed to read image dimensions: {e}")))?;
-        if w > MAX_SIDE_PIXELS || h > MAX_SIDE_PIXELS {
-            return Err(GenError::ImageTooLarge);
-        }
-    }
-
-    // 系统/ColorSync 解码链路直接读取路径，避免对 HEIC/RAW 再整文件读入内存。
-    let raw = if extended_formats::needs_colorsync_output(path) {
-        Vec::new()
-    } else {
-        fs::read(path).map_err(|e| GenError::IoFailed(format!("Failed to read image file: {e}")))?
+            .map_err(|e| GenError::DecodeFailed(format!("Failed to read image dimensions: {e}")))?
     };
 
-    // Decode image.
-    let system_decode_dir = cache_dir
-        .parent()
-        .map(|directory| directory.join("system-decode"));
-    let img = decode_image_in(&raw, &ext, path, system_decode_dir.as_deref())
-        .map_err(|e| GenError::DecodeFailed(format!("Failed to decode image: {e}")))?;
+    // 2. 取缩略源：超限（单边 > MAX_SIDE_PIXELS 或像素 > MAX_INPROC_PIXELS）改用 sips
+    //    子进程降采样（解码在 sips 进程内、内存隔离），否则本进程解码。
+    let oversized =
+        w > MAX_SIDE_PIXELS || h > MAX_SIDE_PIXELS || (w as u64 * h as u64) > MAX_INPROC_PIXELS;
+    let img = if oversized {
+        extended_formats::downscale_with_sips_in(path, size, system_decode_dir.as_deref())
+            .map_err(GenError::DecodeFailed)?
+    } else {
+        // 系统/ColorSync 链路直接读路径（避免对 HEIC/RAW 再整文件读入内存）。
+        let raw = if extended_formats::needs_colorsync_output(path) {
+            Vec::new()
+        } else {
+            fs::read(path)
+                .map_err(|e| GenError::IoFailed(format!("Failed to read image file: {e}")))?
+        };
+        decode_image_in(&raw, &ext, path, system_decode_dir.as_deref())
+            .map_err(|e| GenError::DecodeFailed(format!("Failed to decode image: {e}")))?
+    };
 
-    // Resize to fit within size×size.
+    // 3. Resize to fit within size×size.
     let thumb = img.thumbnail(size, size);
 
     // Encode as WebP (image 0.25 built-in support).
