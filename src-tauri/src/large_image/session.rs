@@ -49,10 +49,13 @@ pub struct ImageSession {
     /// 是否支持原始分辨率瓦片读取；M4 仅支持 24/32-bit BI_RGB BMP。
     pub tileable: bool,
     pub raw_preview: bool,
-    /// 瓦片读取的源文件：BMP 为原文件，非 BMP 为解码后落盘的临时 32-bit BMP 栅格。
+    /// 瓦片读取的源文件：BMP 为原文件，非 BMP 为解码后落盘的临时 BMP 栅格。
     pub tile_source_path: std::path::PathBuf,
     /// tile_source_path 是否为本引擎生成的临时栅格（会话关闭时删除）。
     pub tile_source_is_temp: bool,
+    /// 待落盘的已解码图（非 BMP 大图）：open 时不写栅格、先返回预览，
+    /// 首个瓦片请求或后台任务调用 ensure_raster 时写盘并释放此图。None 表示无需/已完成。
+    pub pending_raster: Mutex<Option<image::DynamicImage>>,
     /// 预览图原始 RGBA 字节（不编码，前端用 ImageData 渲染，避免 WebP 编码耗时）。
     /// 像素尺寸通过 OpenLargeImageResult.preview_w/h 告知前端。
     pub preview_rgba: Vec<u8>,
@@ -304,6 +307,24 @@ pub fn generate_generic_preview(
 
 // ─────────────────────────── 协议处理器 ───────────────────────────
 
+/// 确保非 BMP 大图的临时栅格已落盘（懒生成）。首次调用写盘并释放解码图；已写过则快速返回。
+/// per-session 互斥锁串行化并发的首个瓦片请求与后台任务，保证只写一次。
+fn ensure_raster(session: &ImageSession) -> Result<(), LargeImageError> {
+    let mut pending = session.pending_raster.lock().unwrap();
+    let Some(img) = pending.take() else {
+        return Ok(());
+    };
+    let (w, h) = (session.width, session.height);
+    // 无 alpha → 24-bit（更省内存与磁盘）；有 alpha → 32-bit。
+    if img.color().has_alpha() {
+        let rgba = img.into_rgba8();
+        write_temp_bmp_raster(rgba.as_raw(), 4, w, h, &session.tile_source_path)
+    } else {
+        let rgb = img.into_rgb8();
+        write_temp_bmp_raster(rgb.as_raw(), 3, w, h, &session.tile_source_path)
+    }
+}
+
 /// 最近邻把 RGBA 缩到最长边 ≤ cap，返回 (rgba, w, h)。
 fn downscale_rgba(src: &[u8], sw: u32, sh: u32, cap: u32) -> (Vec<u8>, u32, u32) {
     let (nw, nh) = scale_to_fit_correct(sw, sh, cap);
@@ -463,22 +484,23 @@ pub fn handle_tile_request(
         }
     }
 
-    // 取出会话信息（锁外解码）
-    let (path, tile_size, img_w, img_h) = {
+    // 取出会话（锁外操作）
+    let session = {
         let guard = state_arc.lock().unwrap();
-        let session = guard
-            .find_session(session_id)
-            .ok_or_else(|| (404, LargeImageError::session_not_found(session_id)))?;
-        if !session.tileable {
-            return Err((415, LargeImageError::tiles_unavailable()));
-        }
-        (
-            session.tile_source_path.clone(),
-            session.tile_size,
-            session.width,
-            session.height,
-        )
-    };
+        guard.find_session(session_id)
+    }
+    .ok_or_else(|| (404, LargeImageError::session_not_found(session_id)))?;
+    if !session.tileable {
+        return Err((415, LargeImageError::tiles_unavailable()));
+    }
+    // 非 BMP 大图：首个瓦片触发懒生成栅格（后台任务可能已写好；per-session 锁保证只写一次）。
+    ensure_raster(&session).map_err(|e| (500u16, e))?;
+    let (path, tile_size, img_w, img_h) = (
+        session.tile_source_path.clone(),
+        session.tile_size,
+        session.width,
+        session.height,
+    );
 
     // 验证瓦片范围
     let tiles_x = (img_w + tile_size - 1) / tile_size;
@@ -515,6 +537,8 @@ struct PreparedImage {
     raw_preview: bool,
     tile_source_path: std::path::PathBuf,
     tile_source_is_temp: bool,
+    /// 非 BMP 大图：待后台/懒生成栅格的已解码图（其余情况为 None）。
+    pending_img: Option<image::DynamicImage>,
 }
 
 /// 打开大图，创建会话，返回会话信息。
@@ -574,6 +598,7 @@ pub async fn open_large_image(
         raw_preview,
         tile_source_path,
         tile_source_is_temp,
+        pending_img,
     } = tokio::task::spawn_blocking(move || -> Result<PreparedImage, LargeImageError> {
         if ext == "bmp" {
             use crate::large_image::bmp::BmpInfo;
@@ -589,6 +614,7 @@ pub async fn open_large_image(
                 raw_preview: false,
                 tile_source_path: path_clone,
                 tile_source_is_temp: false,
+                pending_img: None,
             });
         }
 
@@ -616,6 +642,7 @@ pub async fn open_large_image(
                 raw_preview: extended_formats::is_raw(&path_clone),
                 tile_source_path: path_clone,
                 tile_source_is_temp: false,
+                pending_img: None,
             });
         }
 
@@ -627,19 +654,12 @@ pub async fn open_large_image(
         let (preview, pw, ph) = fast_preview_rgba(&img, preview_max_size.min(PREVIEW_RAW_CAP));
         let pixels = w as u64 * h as u64;
 
-        // 像素在上限内且有缓存目录：落临时栅格，启用清晰分块。
+        // 像素在上限内且有缓存目录：标记 tileable，但栅格延迟到首个瓦片/后台任务再写
+        // （ensure_raster），open 先返回预览，把整图解码移出"打开→出图"关键路径。
         if pixels <= MAX_RASTER_PIXELS {
             if let Some(dir) = large_raster_dir.as_deref() {
                 let seq = RASTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let raster = dir.join(format!("raster-{seq}.bmp"));
-                // 无 alpha → 24-bit（省去 RGBA 转换与一份整图大小的缓冲，降低峰值内存）；有 alpha → 32-bit。
-                if img.color().has_alpha() {
-                    let rgba = img.into_rgba8();
-                    write_temp_bmp_raster(rgba.as_raw(), 4, w, h, &raster)?;
-                } else {
-                    let rgb = img.into_rgb8();
-                    write_temp_bmp_raster(rgb.as_raw(), 3, w, h, &raster)?;
-                }
                 return Ok(PreparedImage {
                     width: w,
                     height: h,
@@ -650,6 +670,7 @@ pub async fn open_large_image(
                     raw_preview: false,
                     tile_source_path: raster,
                     tile_source_is_temp: true,
+                    pending_img: Some(img),
                 });
             }
         }
@@ -665,6 +686,7 @@ pub async fn open_large_image(
             raw_preview: false,
             tile_source_path: path_clone,
             tile_source_is_temp: false,
+            pending_img: None,
         })
     })
     .await
@@ -698,6 +720,7 @@ pub async fn open_large_image(
         tile_source_is_temp,
         preview_rgba,
         nav_preview_webp,
+        pending_raster: Mutex::new(pending_img),
     });
     let result = OpenLargeImageResult {
         session_id: session.session_id,
@@ -710,10 +733,21 @@ pub async fn open_large_image(
         preview_w,
         preview_h,
     };
+    // 非 BMP 大图：后台尽快写栅格（即使用户不放大也释放整图内存；首个瓦片请求亦会触发 ensure_raster）。
+    let bg_session = if tile_source_is_temp {
+        Some(session.clone())
+    } else {
+        None
+    };
     let evicted_temps = guard.add_session(session);
     drop(guard);
     for temp in evicted_temps {
         let _ = std::fs::remove_file(temp);
+    }
+    if let Some(session) = bg_session {
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = ensure_raster(&session);
+        });
     }
 
     Ok(result)
@@ -799,6 +833,7 @@ mod tests {
             tile_source_is_temp: false,
             preview_rgba: vec![],
             nav_preview_webp: vec![],
+            pending_raster: Mutex::new(None),
         })
     }
 
