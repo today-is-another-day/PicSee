@@ -11,6 +11,7 @@ export type ViewerBackground = 'dark' | 'light' | 'checkerboard' | 'custom'
 export interface AppSettings {
   language: AppLanguage
   theme: AppTheme
+  shortcuts: Record<string, string>
   viewer: {
     defaultZoomMode: ZoomMode
     zoomStep: number

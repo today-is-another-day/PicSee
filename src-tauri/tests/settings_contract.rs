@@ -9,6 +9,7 @@ fn default_settings_match_expected_baseline() {
 
     assert_eq!(settings.language, Language::System);
     assert_eq!(settings.theme, Theme::System);
+    assert!(settings.shortcuts.is_empty());
     assert_eq!(
         settings.viewer.default_zoom_mode,
         DefaultZoomMode::FitWindow
@@ -108,6 +109,26 @@ fn settings_file_round_trip_preserves_values() {
 
     assert_eq!(loaded, settings);
     std::fs::remove_dir_all(temp_dir).expect("应清理测试目录");
+}
+
+#[test]
+fn shortcuts_round_trip_and_missing_field_default() {
+    let mut settings = AppSettings::default();
+    settings
+        .shortcuts
+        .insert("openFile".into(), "Mod+KeyP".into());
+    let json = serde_json::to_string(&settings).expect("设置应可序列化");
+    let loaded: AppSettings = serde_json::from_str(&json).expect("快捷键设置应可反序列化");
+    assert_eq!(
+        loaded.shortcuts.get("openFile"),
+        Some(&"Mod+KeyP".to_string())
+    );
+
+    let mut legacy = serde_json::to_value(&settings).expect("设置应可序列化");
+    legacy.as_object_mut().unwrap().remove("shortcuts");
+    let loaded_legacy: AppSettings =
+        serde_json::from_value(legacy).expect("缺少 shortcuts 的旧设置应可加载");
+    assert!(loaded_legacy.shortcuts.is_empty());
 }
 
 fn test_directory(name: &str) -> std::path::PathBuf {

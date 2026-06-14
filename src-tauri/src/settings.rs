@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -14,6 +15,9 @@ pub struct AppSettings {
     pub language: Language,
     /// 界面主题。
     pub theme: Theme,
+    /// 用户自定义快捷键；Rust 仅负责透传持久化。
+    #[serde(default)]
+    pub shortcuts: BTreeMap<String, String>,
     /// 查看器设置。
     pub viewer: ViewerSettings,
     /// 大图处理设置。
@@ -218,6 +222,7 @@ impl Default for AppSettings {
         Self {
             language: Language::System,
             theme: Theme::System,
+            shortcuts: BTreeMap::new(),
             viewer: ViewerSettings::default(),
             large_image: LargeImageSettings::default(),
             cache: CacheSettings::default(),

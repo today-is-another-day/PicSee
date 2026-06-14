@@ -19,6 +19,7 @@ import { useViewerStore } from '@/stores/viewer'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useLargeImage } from '@/composables/useLargeImage'
 import { useFileOperations } from '@/composables/useFileOperations'
+import { eventToChord, resolveAction, type ActionId } from '@/utils/shortcuts'
 
 const appStore = useAppStore()
 const { t } = useI18n()
@@ -124,71 +125,66 @@ async function toggleFullscreen(force?: boolean) {
 
 function handleKeydown(event: KeyboardEvent) {
   if (appStore.settingsVisible || isEditableTarget(event.target)) return
-  const command = event.metaKey || event.ctrlKey
-  if (command && event.key.toLowerCase() === 'o') {
+  if (event.code === 'Escape' && viewerStore.isFullscreen) {
     event.preventDefault()
-    void (event.shiftKey ? directoryStore.openDirectory() : directoryStore.openImageFile())
+    void toggleFullscreen(false)
     return
   }
-  if (command && event.key === ',') {
-    event.preventDefault()
-    appStore.openSettings()
-    return
-  }
-  if (command && event.shiftKey && event.key.toLowerCase() === 'r') {
-    event.preventDefault()
-    void fileOperations.revealCurrent()
-    return
-  }
-  const selection = window.getSelection()
-  if (command && event.key.toLowerCase() === 'c'
-    && directoryStore.currentEntry
-    && (!selection || selection.isCollapsed)) {
-    event.preventDefault()
-    void fileOperations.copyCurrentFile()
-    return
-  }
-  if ((event.key === 'Delete' || (command && event.key === 'Backspace'))) {
+  if (event.code === 'Backspace' && (event.metaKey || event.ctrlKey)) {
     event.preventDefault()
     void fileOperations.deleteCurrent()
     return
   }
-  if (command || event.altKey) return
+  if (event.code === 'Space') {
+    if (shouldThrottleNavigation(event, 'next')) return
+    event.preventDefault()
+    directoryStore.selectNext()
+    return
+  }
+  const chord = eventToChord(event)
+  if (!chord) return
+  const action = resolveAction(chord, settings.value.shortcuts)
+  if (!action) return
 
   // 方向键 auto-repeat 节流（各键独立时间戳，互不干扰）
-  if (event.repeat && (event.key === 'ArrowLeft' || event.key === 'ArrowRight'
-    || event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
-    const now = Date.now()
-    const last = lastRepeatTime[event.key] ?? 0
-    if (now - last < REPEAT_THROTTLE_MS) {
-      event.preventDefault()
-      return
-    }
-    lastRepeatTime[event.key] = now
-  }
+  if ((action === 'previous' || action === 'next') && shouldThrottleNavigation(event, action)) return
 
-  const actions: Record<string, () => void> = {
-    ArrowLeft: directoryStore.selectPrevious,
-    ArrowRight: directoryStore.selectNext,
-    ' ': directoryStore.selectNext,
-    '+': () => viewerStore.zoomIn(settings.value.viewer.zoomStep),
-    '=': () => viewerStore.zoomIn(settings.value.viewer.zoomStep),
-    '-': () => viewerStore.zoomOut(settings.value.viewer.zoomStep),
-    '0': () => viewerStore.applyDisplayMode('fit-window'),
-    '1': () => viewerStore.applyDisplayMode('actual-size'),
-    f: () => void toggleFullscreen(),
-    F: () => void toggleFullscreen(),
-    r: fileOperations.rotateClockwise,
-    R: fileOperations.rotateCounterClockwise,
-    Escape: () => {
-      if (viewerStore.isFullscreen) void toggleFullscreen(false)
+  const actions: Record<ActionId, () => void> = {
+    openFile: () => void directoryStore.openImageFile(),
+    openDirectory: () => void directoryStore.openDirectory(),
+    settings: appStore.openSettings,
+    reveal: () => void fileOperations.revealCurrent(),
+    copyFile: () => {
+      const selection = window.getSelection()
+      if (directoryStore.currentEntry && (!selection || selection.isCollapsed)) {
+        void fileOperations.copyCurrentFile()
+      }
     },
+    delete: () => void fileOperations.deleteCurrent(),
+    previous: directoryStore.selectPrevious,
+    next: directoryStore.selectNext,
+    zoomIn: () => viewerStore.zoomIn(settings.value.viewer.zoomStep),
+    zoomOut: () => viewerStore.zoomOut(settings.value.viewer.zoomStep),
+    fitWindow: () => viewerStore.applyDisplayMode('fit-window'),
+    actualSize: () => viewerStore.applyDisplayMode('actual-size'),
+    fullscreen: () => void toggleFullscreen(),
+    rotateClockwise: fileOperations.rotateClockwise,
+    rotateCounterClockwise: fileOperations.rotateCounterClockwise,
   }
-  const action = actions[event.key]
-  if (action) {
+  event.preventDefault()
+  actions[action]()
+}
+
+function shouldThrottleNavigation(event: KeyboardEvent, action: 'previous' | 'next') {
+  if (!event.repeat) return false
+  const now = Date.now()
+  const last = lastRepeatTime[action] ?? 0
+  if (now - last < REPEAT_THROTTLE_MS) {
     event.preventDefault()
-    action()
+    return true
   }
+  lastRepeatTime[action] = now
+  return false
 }
 
 function isEditableTarget(target: EventTarget | null) {

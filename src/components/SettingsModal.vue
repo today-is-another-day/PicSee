@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, toRaw, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, toRaw, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -7,16 +7,36 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { DEFAULT_SETTINGS, useSettingsStore } from '@/stores/settings'
 import type { AppSettings } from '@/types/settings'
+import {
+  DEFAULT_SHORTCUTS,
+  eventToChord,
+  findConflicts,
+  formatChord,
+  type ActionId,
+} from '@/utils/shortcuts'
 
 const { t } = useI18n()
 const appStore = useAppStore()
 const settingsStore = useSettingsStore()
 const { settings, saving } = storeToRefs(settingsStore)
 const draft = ref<AppSettings>(structuredClone(toRaw(settings.value)))
+const capturingAction = ref<ActionId | null>(null)
+const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
+
+const shortcutGroups: Array<{ key: string, actions: ActionId[] }> = [
+  { key: 'general', actions: ['openFile', 'openDirectory', 'settings', 'fullscreen'] },
+  { key: 'browse', actions: ['previous', 'next'] },
+  { key: 'view', actions: ['zoomIn', 'zoomOut', 'fitWindow', 'actualSize', 'rotateClockwise', 'rotateCounterClockwise'] },
+  { key: 'file', actions: ['reveal', 'copyFile', 'delete'] },
+]
+const shortcutConflicts = computed(() => findConflicts(draft.value.shortcuts))
+const conflictingActions = computed(() => new Set(Object.values(shortcutConflicts.value).flat()))
+const hasShortcutConflicts = computed(() => Object.keys(shortcutConflicts.value).length > 0)
 
 watch(
   () => appStore.settingsVisible,
   () => {
+    stopCapture()
     draft.value = structuredClone(toRaw(settings.value))
   },
 )
@@ -66,6 +86,7 @@ const viewerBackgroundOptions = computed(() => [
 ])
 
 async function handleSave() {
+  if (hasShortcutConflicts.value) return
   try {
     await settingsStore.saveSettings(draft.value)
     message.success(t('settings.saved'))
@@ -81,9 +102,45 @@ function handleReset() {
   message.success(t('settings.resetDone'))
 }
 
+function resetShortcuts() {
+  stopCapture()
+  draft.value.shortcuts = { ...DEFAULT_SHORTCUTS }
+}
+
+function startCapture(action: ActionId) {
+  if (capturingAction.value === action) {
+    stopCapture()
+    return
+  }
+  stopCapture()
+  capturingAction.value = action
+  window.addEventListener('keydown', handleShortcutCapture, true)
+}
+
+function stopCapture() {
+  capturingAction.value = null
+  window.removeEventListener('keydown', handleShortcutCapture, true)
+}
+
+function handleShortcutCapture(event: KeyboardEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.code === 'Escape') {
+    stopCapture()
+    return
+  }
+  const chord = eventToChord(event)
+  if (!chord || !capturingAction.value) return
+  draft.value.shortcuts[capturingAction.value] = chord
+  stopCapture()
+}
+
 function handleCancel() {
+  stopCapture()
   appStore.closeSettings()
 }
+
+onBeforeUnmount(stopCapture)
 </script>
 
 <template>
@@ -181,7 +238,39 @@ function handleCancel() {
       </a-tab-pane>
 
       <a-tab-pane key="shortcuts" :tab="t('settings.group.shortcuts')">
-        <a-empty :description="t('settings.shortcutsDescription')" />
+        <div class="shortcuts-panel">
+          <p class="settings-description">{{ t('settings.shortcutsDescription') }}</p>
+          <div v-for="group in shortcutGroups" :key="group.key" class="shortcut-group">
+            <h3 class="shortcut-group__title">{{ t(`settings.shortcutGroup.${group.key}`) }}</h3>
+            <div
+              v-for="action in group.actions"
+              :key="action"
+              class="shortcut-row"
+              :class="{ 'shortcut-row--conflict': conflictingActions.has(action) }"
+            >
+              <div>
+                <div class="shortcut-row__label">{{ t(`settings.shortcutAction.${action}`) }}</div>
+                <div v-if="conflictingActions.has(action)" class="shortcut-row__conflict">
+                  ⚠ {{ t('settings.shortcutConflict') }}
+                </div>
+              </div>
+              <a-button
+                class="shortcut-row__button"
+                :danger="conflictingActions.has(action)"
+                @click="startCapture(action)"
+                @blur="capturingAction === action && stopCapture()"
+              >
+                {{ capturingAction === action ? t('settings.shortcutCapture') : formatChord(draft.shortcuts[action], isMac) }}
+              </a-button>
+            </div>
+          </div>
+          <div class="shortcut-actions">
+            <a-button @click="resetShortcuts">{{ t('settings.resetShortcuts') }}</a-button>
+            <span v-if="hasShortcutConflicts" class="shortcut-save-warning">
+              ⚠ {{ t('settings.shortcutSaveBlocked') }}
+            </span>
+          </div>
+        </div>
       </a-tab-pane>
 
       <a-tab-pane key="language" :tab="t('settings.group.language')">
@@ -200,7 +289,7 @@ function handleCancel() {
         <a-button @click="handleReset">{{ t('action.reset') }}</a-button>
         <div>
           <a-button @click="handleCancel">{{ t('action.cancel') }}</a-button>
-          <a-button type="primary" :loading="saving" @click="handleSave">{{ t('action.save') }}</a-button>
+          <a-button type="primary" :loading="saving" :disabled="hasShortcutConflicts" @click="handleSave">{{ t('action.save') }}</a-button>
         </div>
       </div>
     </template>
@@ -230,6 +319,44 @@ function handleCancel() {
 
 .settings-description {
   color: var(--muted-color);
+}
+
+.shortcut-group {
+  margin-top: 18px;
+}
+
+.shortcut-group__title {
+  margin: 0 0 8px;
+  color: var(--muted-color);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.shortcut-row {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.shortcut-row__conflict,
+.shortcut-save-warning {
+  color: var(--ant-color-error, #ff4d4f);
+  font-size: 12px;
+}
+
+.shortcut-row__button {
+  min-width: 136px;
+}
+
+.shortcut-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 20px;
 }
 
 .settings-footer,

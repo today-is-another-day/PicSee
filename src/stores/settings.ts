@@ -3,10 +3,12 @@ import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 
 import type { AppSettings } from '@/types/settings'
+import { DEFAULT_SHORTCUTS } from '@/utils/shortcuts'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   language: 'system',
   theme: 'system',
+  shortcuts: { ...DEFAULT_SHORTCUTS },
   viewer: {
     defaultZoomMode: 'fit-window',
     zoomStep: 0.1,
@@ -72,7 +74,11 @@ export const useSettingsStore = defineStore('settings', () => {
     loading.value = true
     loadError.value = null
     try {
-      settings.value = await invoke<AppSettings>('get_settings')
+      const loaded = await invoke<AppSettings>('get_settings')
+      settings.value = {
+        ...loaded,
+        shortcuts: { ...DEFAULT_SHORTCUTS, ...(loaded.shortcuts ?? {}) },
+      }
     } catch (error) {
       loadError.value = error
       console.warn('Unable to load settings, using defaults.', error)
