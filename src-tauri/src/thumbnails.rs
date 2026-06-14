@@ -1,5 +1,5 @@
-use crate::extended_formats;
-use image::{DynamicImage, ImageFormat, ImageReader};
+use crate::{color, extended_formats};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -423,8 +423,18 @@ fn decode_image_in(
         return Ok(img);
     }
 
-    let img = image::load_from_memory(raw)
+    let reader = ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to guess image format ({}): {e}", path.display()))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("Failed to create image decoder ({}): {e}", path.display()))?;
+    let icc = decoder.icc_profile().unwrap_or(None);
+    let mut img = DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("Failed to decode image ({}): {e}", path.display()))?;
+    if let Some(icc) = icc {
+        img = color::dynamic_image_to_srgb(img, &icc);
+    }
 
     // Minor 3: apply EXIF orientation for any container kamadak-exif supports
     // (JPEG, WebP, PNG with Exif chunk, TIFF, etc.); silently ignored when absent.

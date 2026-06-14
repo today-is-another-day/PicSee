@@ -1,3 +1,4 @@
+pub mod color;
 pub mod extended_formats;
 pub mod file_operations;
 pub mod images;

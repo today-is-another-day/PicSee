@@ -10,8 +10,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Semaphore;
 
-use crate::extended_formats;
+use image::ImageDecoder;
+
 use crate::settings::read_settings_file;
+use crate::{color, extended_formats};
 
 use super::{
     bmp::{BmpReader, Rect},
@@ -291,7 +293,7 @@ pub fn generate_generic_preview(
     let img = if extended_formats::needs_colorsync_output(path) {
         extended_formats::decode_system_image(path).map_err(LargeImageError::system_decode)?
     } else {
-        image::open(path).map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?
+        decode_profiled_image(path)?
     };
 
     let (w, h) = (img.width(), img.height());
@@ -303,6 +305,24 @@ pub fn generate_generic_preview(
     drop(img);
     let rgba = thumb.to_rgba8();
     Ok((rgba.into_raw(), thumb.width(), thumb.height()))
+}
+
+/// 通过 image-rs decoder 提取 ICC，并在解码后转换为 sRGB。
+fn decode_profiled_image(path: &Path) -> Result<image::DynamicImage, LargeImageError> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|e| LargeImageError::decode(format!("打开图像失败: {e}")))?
+        .with_guessed_format()
+        .map_err(|e| LargeImageError::decode(format!("识别图像格式失败: {e}")))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| LargeImageError::decode(format!("创建图像解码器失败: {e}")))?;
+    let icc = decoder.icc_profile().unwrap_or(None);
+    let mut img = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
+    if let Some(icc) = icc {
+        img = color::dynamic_image_to_srgb(img, &icc);
+    }
+    Ok(img)
 }
 
 // ─────────────────────────── 协议处理器 ───────────────────────────
@@ -643,8 +663,7 @@ pub async fn open_large_image(
         }
 
         // 非 BMP 普通格式（PNG/JPEG/WebP…）：解码一次 → 预览 + 临时 32-bit BMP 栅格（供分块）。
-        let img = image::open(&path_clone)
-            .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
+        let img = decode_profiled_image(&path_clone)?;
         let (w, h) = (img.width(), img.height());
         // 快速最近邻预览（直接采样源缓冲，比 thumbnail 多遍缩放快得多）。
         let (preview, pw, ph) = fast_preview_rgba(&img, preview_max_size.min(PREVIEW_RAW_CAP));
