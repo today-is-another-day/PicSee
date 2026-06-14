@@ -37,3 +37,22 @@ body {
   overflow: hidden;
   background: var(--app-bg);
 }
+
+/* 桌面应用：全局禁止选中文本/图片/按钮，禁止图片拖拽（更像原生 App）。 */
+#app {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+/* 例外：输入类控件需可选中/编辑（设置里的输入框、颜色选择等）。 */
+input,
+textarea,
+[contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+img {
+  -webkit-user-drag: none;
+}
