@@ -323,6 +323,42 @@ fn downscale_rgba(src: &[u8], sw: u32, sh: u32, cap: u32) -> (Vec<u8>, u32, u32)
     (out, nw, nh)
 }
 
+/// 从已解码图像快速生成预览 RGBA（最长边 ≤ cap），直接最近邻采样源缓冲。
+///
+/// 比 `DynamicImage::thumbnail`（多遍高质量缩放，需遍历全部源像素）快得多：
+/// 只读取输出像素数量的源像素（带步进），且 Rgb8/Rgba8 直接采样、不做整图 RGBA 转换。
+fn fast_preview_rgba(img: &image::DynamicImage, cap: u32) -> (Vec<u8>, u32, u32) {
+    use image::DynamicImage::{ImageRgb8, ImageRgba8};
+    let (sw, sh) = (img.width(), img.height());
+    let (pw, ph) = scale_to_fit_correct(sw, sh, cap);
+
+    let sample = |raw: &[u8], ch: usize| {
+        let mut out = vec![0u8; pw as usize * ph as usize * 4];
+        for ty in 0..ph as usize {
+            let sy = (ty as u64 * sh as u64 / ph as u64) as usize;
+            let row = sy * sw as usize * ch;
+            for tx in 0..pw as usize {
+                let sx = (tx as u64 * sw as u64 / pw as u64) as usize;
+                let s = row + sx * ch;
+                let d = (ty * pw as usize + tx) * 4;
+                out[d] = raw[s];
+                out[d + 1] = raw[s + 1];
+                out[d + 2] = raw[s + 2];
+                out[d + 3] = if ch == 4 { raw[s + 3] } else { 255 };
+            }
+        }
+        out
+    };
+
+    let out = match img {
+        ImageRgb8(buf) => sample(buf.as_raw(), 3),
+        ImageRgba8(buf) => sample(buf.as_raw(), 4),
+        // 其它色彩类型较少见：转 RGBA 后再采样（一次性，体量小图才会到这里）。
+        other => sample(other.to_rgba8().as_raw(), 4),
+    };
+    (out, pw, ph)
+}
+
 /// 从预览 RGBA 生成导航窗用的小 WebP（最长边 ≤ NAV_PREVIEW_CAP，编码极快）。
 pub fn make_nav_preview(preview_rgba: &[u8], pw: u32, ph: u32) -> Result<Vec<u8>, LargeImageError> {
     let (small, nw, nh) = downscale_rgba(preview_rgba, pw, ph, NAV_PREVIEW_CAP);
@@ -569,12 +605,11 @@ pub async fn open_large_image(
                 preview_max_size
             }
             .min(PREVIEW_RAW_CAP);
-            let thumb = decoded.thumbnail(preview_limit, preview_limit).to_rgba8();
-            let (tw, th) = (thumb.width(), thumb.height());
+            let (preview, tw, th) = fast_preview_rgba(&decoded, preview_limit);
             return Ok(PreparedImage {
                 width: w,
                 height: h,
-                preview_rgba: thumb.into_raw(),
+                preview_rgba: preview,
                 preview_w: tw,
                 preview_h: th,
                 tileable: false,
@@ -588,12 +623,8 @@ pub async fn open_large_image(
         let img = image::open(&path_clone)
             .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
         let (w, h) = (img.width(), img.height());
-        let cap = preview_max_size.min(PREVIEW_RAW_CAP);
-        let (req_w, req_h) = scale_to_fit_correct(w, h, cap);
-        // thumbnail 保持纵横比，实际尺寸可能 ≠ (req_w, req_h)，必须用实际尺寸告知前端。
-        let thumb = img.thumbnail(req_w, req_h).to_rgba8();
-        let (pw, ph) = (thumb.width(), thumb.height());
-        let preview = thumb.into_raw();
+        // 快速最近邻预览（直接采样源缓冲，比 thumbnail 多遍缩放快得多）。
+        let (preview, pw, ph) = fast_preview_rgba(&img, preview_max_size.min(PREVIEW_RAW_CAP));
         let pixels = w as u64 * h as u64;
 
         // 像素在上限内且有缓存目录：落临时栅格，启用清晰分块。
