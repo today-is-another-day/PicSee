@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useI18n } from 'vue-i18n'
 
+import logoUrl from '@/assets/logo.svg'
 import { useAppStore } from '@/stores/app'
 import { useDirectoryStore } from '@/stores/directory'
 import { useSettingsStore } from '@/stores/settings'
@@ -16,7 +17,7 @@ const viewerStore = useViewerStore()
 <template>
   <header class="top-toolbar">
     <div class="top-toolbar__brand">
-      <span class="top-toolbar__logo">P</span>
+      <img class="top-toolbar__logo" :src="logoUrl" alt="" draggable="false" />
       <div>
         <strong>{{ t('app.name') }}</strong>
       </div>
@@ -68,14 +69,10 @@ const viewerStore = useViewerStore()
 }
 
 .top-toolbar__logo {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  place-items: center;
-  border-radius: 10px;
-  background: #1677ff;
-  color: white !important;
-  font-size: 18px !important;
-  font-weight: 700;
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 </style>

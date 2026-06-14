@@ -1,0 +1,20 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef3fb"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS 风格圆角卡片底,四周留白 -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#card)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="184.5" ry="184.5" fill="none" stroke="#d9e2ef" stroke-width="1"/>
+  <!-- 图片图标,居中缩放 -->
+  <g transform="translate(232,232) scale(0.547)">
+    <path d="M656 400m-80 0a80 80 0 1 0 160 0 80 80 0 1 0-160 0Z" fill="#CAE705"></path>
+    <path d="M340.96 558.08L85.12 771.84a32 32 0 0 1-41.056-49.12l276.128-230.72a32 32 0 0 1 40.768-0.224l282.048 230.72a32 32 0 0 1-40.512 49.536l-261.536-213.952z" fill="#2B82D8"></path>
+    <path d="M596.992 718.336l-39.36-50.464 381.504-297.472 39.36 50.496z" fill="#2B82D8"></path>
+    <path d="M419.232 616.736l194.592 143.776L928 512v256a128 128 0 0 1-128 128H192l-77.12-41.408 304.352-237.856z" fill="#CAE705"></path>
+    <path d="M160 192a64 64 0 0 0-64 64v512a64 64 0 0 0 64 64h704a64 64 0 0 0 64-64V256a64 64 0 0 0-64-64H160z m0-64h704a128 128 0 0 1 128 128v512a128 128 0 0 1-128 128H160a128 128 0 0 1-128-128V256a128 128 0 0 1 128-128z" fill="#2B82D8"></path>
+    <path d="M596.992 718.336l-39.36-50.464 381.504-297.472 39.36 50.496zM640 416a32 32 0 1 0 0-64 32 32 0 0 0 0 64z m0 64a96 96 0 1 1 0-192 96 96 0 0 1 0 192z" fill="#2B82D8"></path>
+  </g>
+</svg>
