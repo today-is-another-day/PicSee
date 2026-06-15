@@ -116,7 +116,7 @@ pub fn probe_image_file(
         let info = super::bmp::BmpInfo::from_file(path)?;
         (info.width, info.height, "bmp".to_string(), true, false)
     } else if system_decoded {
-        let (w, h) = extended_formats::probe_system_image(path)
+        let (w, h) = extended_formats::probe_system_dimensions(path)
             .map_err(LargeImageError::from_system_decode)?;
         (w, h, ext.clone(), false, extended_formats::is_raw(path))
     } else {

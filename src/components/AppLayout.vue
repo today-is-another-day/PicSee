@@ -104,6 +104,8 @@ watch(
         preloadCache.set(path, img)
       }
     }
+
+    void invoke('prefetch_system_decode', { paths: [...needed] }).catch(() => {})
   },
 )
 

@@ -1,15 +1,35 @@
 use image::DynamicImage;
+use lru::LruCache;
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
+    time::{Duration, Instant, UNIX_EPOCH},
 };
+use tauri::{AppHandle, Manager};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SYSTEM_DECODE_CACHE: OnceLock<Mutex<LruCache<CacheKey, CachedDecode>>> = OnceLock::new();
+static SYSTEM_PREFETCH_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const SIPS_TIMEOUT: Duration = Duration::from_secs(30);
+const SYSTEM_DECODE_CACHE_CAPACITY: usize = 6;
 pub const SYSTEM_MAX_SIDE_PIXELS: u32 = 12_000;
 pub const SYSTEM_MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+
+type CacheKey = (PathBuf, i64);
+
+#[derive(Clone)]
+struct CachedDecode {
+    width: u32,
+    height: u32,
+    png_path: PathBuf,
+}
 
 pub const TIFF_EXTENSIONS: [&str; 2] = ["tif", "tiff"];
 pub const SYSTEM_EXTENSIONS: [&str; 10] = [
@@ -49,7 +69,10 @@ pub fn is_heif_content(path: &Path) -> bool {
     if read < 12 || &header[4..8] != b"ftyp" {
         return false;
     }
-    if HEIF_BRANDS.iter().any(|brand| brand.as_slice() == &header[8..12]) {
+    if HEIF_BRANDS
+        .iter()
+        .any(|brand| brand.as_slice() == &header[8..12])
+    {
         return true;
     }
     let mut offset = 16;
@@ -85,30 +108,69 @@ pub fn decode_system_image_in(
     path: &Path,
     preferred_directory: Option<&Path>,
 ) -> Result<DynamicImage, String> {
-    // 所有入口都先做 header-only 安全检查，避免未来新增调用点绕过尺寸限制。
+    let cache_key = system_decode_cache_key(path);
+    if let Some(cached) = cache_key.as_ref().and_then(get_cached_decode) {
+        if let Ok(decoded) = image::open(&cached.png_path) {
+            return Ok(decoded);
+        }
+        remove_cached_decode(cache_key.as_ref().unwrap());
+    }
+
+    // 未命中缓存的入口先做 header-only 安全检查，避免未来新增调用点绕过尺寸限制。
     probe_system_image(path)?;
     let directory = runtime_decode_directory(preferred_directory)?;
-    let output = temporary_png_path(&directory);
+    let temporary_output = temporary_png_path(&directory);
+    let cached_output = cache_key
+        .as_ref()
+        .map(|key| cached_png_path(&directory, key));
     let mut command = Command::new("sips");
     command
         .args(["-s", "format", "png"])
         .args(["-m", "/System/Library/ColorSync/Profiles/sRGB Profile.icc"])
         .arg(path)
         .args(["--out"])
-        .arg(&output);
+        .arg(&temporary_output);
 
+    record_system_decode(path);
     let result = run_command_with_timeout(&mut command, SIPS_TIMEOUT);
     let decoded = match result {
-        Ok(result) if result.status.success() => {
-            image::open(&output).map_err(|error| format!("读取系统解码 PNG 失败: {error}"))
+        Ok(result) if result.status.success() => match image::open(&temporary_output) {
+            Ok(decoded) => {
+                if let (Some(key), Some(png_path)) = (cache_key, cached_output) {
+                    if let Err(error) = std::fs::rename(&temporary_output, &png_path) {
+                        let _ = std::fs::remove_file(&temporary_output);
+                        return Err(format!("保存系统解码缓存 PNG 失败: {error}"));
+                    }
+                    insert_global_cached_decode(
+                        key,
+                        CachedDecode {
+                            width: decoded.width(),
+                            height: decoded.height(),
+                            png_path,
+                        },
+                    );
+                } else {
+                    let _ = std::fs::remove_file(&temporary_output);
+                }
+                Ok(decoded)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary_output);
+                Err(format!("读取系统解码 PNG 失败: {error}"))
+            }
+        },
+        Ok(result) => {
+            let _ = std::fs::remove_file(&temporary_output);
+            Err(format!(
+                "macOS ImageIO 无法解码此格式: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ))
         }
-        Ok(result) => Err(format!(
-            "macOS ImageIO 无法解码此格式: {}",
-            String::from_utf8_lossy(&result.stderr)
-        )),
-        Err(error) => Err(error),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary_output);
+            Err(error)
+        }
     };
-    let _ = std::fs::remove_file(&output);
     decoded
 }
 
@@ -156,6 +218,7 @@ pub fn probe_system_image(path: &Path) -> Result<(u32, u32), String> {
     command
         .args(["-g", "pixelWidth", "-g", "pixelHeight"])
         .arg(path);
+    record_system_probe(path);
     let output = run_command_with_timeout(&mut command, SIPS_TIMEOUT)?;
     if !output.status.success() {
         return Err(format!(
@@ -168,6 +231,52 @@ pub fn probe_system_image(path: &Path) -> Result<(u32, u32), String> {
     let height = parse_sips_property(&stdout, "pixelHeight")?;
     validate_system_dimensions(width, height)?;
     Ok((width, height))
+}
+
+/// 优先复用系统解码缓存中的安全尺寸；未命中时才调用 sips 元数据探测。
+pub fn probe_system_dimensions(path: &Path) -> Result<(u32, u32), String> {
+    if let Some(cached) = system_decode_cache_key(path)
+        .as_ref()
+        .and_then(get_cached_decode)
+    {
+        return Ok((cached.width, cached.height));
+    }
+    probe_system_image(path)
+}
+
+/// 判断当前文件版本是否已有可读的系统解码缓存。
+pub fn is_system_decode_cached(path: &Path) -> bool {
+    system_decode_cache_key(path)
+        .as_ref()
+        .and_then(get_cached_decode)
+        .is_some()
+}
+
+/// 顺序预解码邻图；全局单通道避免快速切图时同时启动多个 sips 子进程。
+#[tauri::command]
+pub async fn prefetch_system_decode(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
+    let _permit = SYSTEM_PREFETCH_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|error| format!("系统解码预取信号量已关闭: {error}"))?;
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取应用缓存目录: {error}"))?
+        .join("system-decode");
+
+    for path in paths {
+        let path = PathBuf::from(path);
+        if !is_system_decoded(&path) || is_system_decode_cached(&path) {
+            continue;
+        }
+        let cache_dir = cache_dir.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let _ = decode_system_image_in(&path, Some(&cache_dir));
+        })
+        .await;
+    }
+    Ok(())
 }
 
 pub fn validate_system_dimensions(width: u32, height: u32) -> Result<(), String> {
@@ -201,6 +310,63 @@ fn temporary_png_path(directory: &Path) -> PathBuf {
     ))
 }
 
+fn cached_png_path(directory: &Path, key: &CacheKey) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    directory.join(format!("picsee-system-decode-{:016x}.png", hasher.finish()))
+}
+
+fn system_decode_cache_key(path: &Path) -> Option<CacheKey> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let nanos = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    let nanos = i64::try_from(nanos).ok()?;
+    Some((path.to_path_buf(), nanos))
+}
+
+fn new_system_decode_cache(capacity: usize) -> LruCache<CacheKey, CachedDecode> {
+    LruCache::new(NonZeroUsize::new(capacity).expect("系统解码缓存容量必须大于 0"))
+}
+
+fn system_decode_cache() -> &'static Mutex<LruCache<CacheKey, CachedDecode>> {
+    SYSTEM_DECODE_CACHE
+        .get_or_init(|| Mutex::new(new_system_decode_cache(SYSTEM_DECODE_CACHE_CAPACITY)))
+}
+
+fn get_cached_decode(key: &CacheKey) -> Option<CachedDecode> {
+    let mut cache = system_decode_cache().lock().unwrap();
+    let cached = cache.get(key)?.clone();
+    if cached.png_path.exists() {
+        Some(cached)
+    } else {
+        cache.pop(key);
+        None
+    }
+}
+
+fn remove_cached_decode(key: &CacheKey) {
+    if let Some(cached) = system_decode_cache().lock().unwrap().pop(key) {
+        let _ = std::fs::remove_file(cached.png_path);
+    }
+}
+
+fn insert_global_cached_decode(key: CacheKey, cached: CachedDecode) {
+    let mut cache = system_decode_cache().lock().unwrap();
+    insert_cached_decode(&mut cache, key, cached);
+}
+
+fn insert_cached_decode(
+    cache: &mut LruCache<CacheKey, CachedDecode>,
+    key: CacheKey,
+    cached: CachedDecode,
+) {
+    let new_png_path = cached.png_path.clone();
+    if let Some((_, evicted)) = cache.push(key, cached) {
+        if evicted.png_path != new_png_path {
+            let _ = std::fs::remove_file(evicted.png_path);
+        }
+    }
+}
+
 fn parse_sips_property(output: &str, property: &str) -> Result<u32, String> {
     output
         .lines()
@@ -209,6 +375,53 @@ fn parse_sips_property(output: &str, property: &str) -> Result<u32, String> {
             (key == property).then(|| value.trim().parse::<u32>().ok())?
         })
         .ok_or_else(|| format!("sips 输出缺少 {property}"))
+}
+
+#[cfg(test)]
+fn test_command_counts() -> &'static Mutex<std::collections::HashMap<(PathBuf, &'static str), u64>>
+{
+    static COUNTS: OnceLock<Mutex<std::collections::HashMap<(PathBuf, &'static str), u64>>> =
+        OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_test_command(path: &Path, command: &'static str) {
+    *test_command_counts()
+        .lock()
+        .unwrap()
+        .entry((path.to_path_buf(), command))
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+fn system_decode_count(path: &Path) -> u64 {
+    test_command_counts()
+        .lock()
+        .unwrap()
+        .get(&(path.to_path_buf(), "decode"))
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn system_probe_count(path: &Path) -> u64 {
+    test_command_counts()
+        .lock()
+        .unwrap()
+        .get(&(path.to_path_buf(), "probe"))
+        .copied()
+        .unwrap_or_default()
+}
+
+fn record_system_decode(_path: &Path) {
+    #[cfg(test)]
+    record_test_command(_path, "decode");
+}
+
+fn record_system_probe(_path: &Path) {
+    #[cfg(test)]
+    record_test_command(_path, "probe");
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output, String> {
@@ -321,6 +534,69 @@ Image.new("RGB", (8, 6), (120, 40, 200)).save(sys.argv[1], format="TIFF", compre
             preferred
         );
         assert!(preferred.is_dir());
+    }
+
+    #[test]
+    fn system_decode_cache_hits_without_decoding_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let tiff = directory.path().join("cached.tiff");
+        let cache_dir = directory.path().join("system-decode");
+        write_compressed_tiff(&tiff, "tiff_lzw");
+
+        let first = decode_system_image_in(&tiff, Some(&cache_dir)).unwrap();
+        let second = decode_system_image_in(&tiff, Some(&cache_dir)).unwrap();
+
+        assert_eq!(first.dimensions(), second.dimensions());
+        assert_eq!(system_decode_count(&tiff), 1);
+    }
+
+    #[test]
+    fn cached_system_dimensions_do_not_probe_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let tiff = directory.path().join("cached-probe.tiff");
+        let cache_dir = directory.path().join("system-decode");
+        write_compressed_tiff(&tiff, "tiff_lzw");
+
+        let decoded = decode_system_image_in(&tiff, Some(&cache_dir)).unwrap();
+        let probes_after_decode = system_probe_count(&tiff);
+
+        assert_eq!(
+            probe_system_dimensions(&tiff).unwrap(),
+            decoded.dimensions()
+        );
+        assert_eq!(system_probe_count(&tiff), probes_after_decode);
+    }
+
+    #[test]
+    fn cache_eviction_removes_png_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cache = new_system_decode_cache(1);
+        let first_png = directory.path().join("first.png");
+        let second_png = directory.path().join("second.png");
+        std::fs::write(&first_png, b"first").unwrap();
+        std::fs::write(&second_png, b"second").unwrap();
+
+        insert_cached_decode(
+            &mut cache,
+            (directory.path().join("first.tiff"), 1),
+            CachedDecode {
+                width: 8,
+                height: 6,
+                png_path: first_png.clone(),
+            },
+        );
+        insert_cached_decode(
+            &mut cache,
+            (directory.path().join("second.tiff"), 2),
+            CachedDecode {
+                width: 8,
+                height: 6,
+                png_path: second_png.clone(),
+            },
+        );
+
+        assert!(!first_png.exists());
+        assert!(second_png.exists());
     }
 
     #[test]

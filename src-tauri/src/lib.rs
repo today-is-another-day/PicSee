@@ -6,6 +6,7 @@ pub mod large_image;
 pub mod settings;
 pub mod thumbnails;
 
+use extended_formats::prefetch_system_decode;
 use file_operations::{copy_file_to_clipboard, move_to_trash, reveal_in_finder};
 use images::{open_directory, open_external_path, open_image_file, scan_directory};
 use large_image::policy::probe_image;
@@ -221,6 +222,8 @@ pub fn run() {
                     .allow_directory(&thumb_dir, false);
                 // 清理上次遗留的大图临时栅格（非 BMP 大图分块用）
                 let _ = std::fs::remove_dir_all(cache_dir.join("large-raster"));
+                // 内存缓存重启后为空，清理上次遗留的系统解码 PNG。
+                let _ = std::fs::remove_dir_all(cache_dir.join("system-decode"));
                 // 启动后在后台按磁盘缓存水位淘汰旧缩略图，不阻塞应用初始化。
                 let disk_cache_limit_bytes = settings
                     .cache
@@ -246,6 +249,7 @@ pub fn run() {
             get_thumbnail,
             clear_thumbnail_cache,
             probe_image,
+            prefetch_system_decode,
             open_large_image,
             close_large_image,
             get_preview,
