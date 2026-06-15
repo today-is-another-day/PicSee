@@ -9,7 +9,7 @@
  * - HiDPI：canvas 物理像素 = CSS px × devicePixelRatio
  * - tile 加载：new Image() + picsee:// URL，onload 后写入 LRU，触发重绘
  * - rAF 合批：zoom/offset 变化通过 watch 请求 rAF，不在 event handler 里直接 drawImage
- * - LRU：Map<key, HTMLImageElement>，上限 TILE_CACHE_LIMIT 个
+ * - LRU：Map<key, TileCacheEntry>，按估算解码字节淘汰
  *
  * 手势层（wheel/drag/双击）由父组件 ImageCanvasViewer 负责，本组件只负责渲染。
  */
@@ -25,6 +25,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import type { LargeImageSession } from '@/types/image'
 import { tileUrl } from '@/utils/largeImageUrl'
+import { evictByBytes, pickLevel, visibleImageRect } from '@/utils/largeImageCanvas'
 
 // ─── Props ────────────────────────────────────────────────────────
 const props = defineProps<{
@@ -44,14 +45,23 @@ const previewImg = shallowRef<ImageBitmap | null>(null)
 const previewLoaded = shallowRef(false)
 
 // ─── Tile LRU cache ───────────────────────────────────────────────
-/** 前端 tile 缓存上限（个）。 */
+/** 保留 Phase 1A 的 S1 可见 tile 数安全守卫。 */
 const TILE_CACHE_LIMIT = 256
+const TILE_CACHE_RATIO = 0.4
+const COARSE_TILE_MARGIN = 64
+
+interface TileCacheEntry {
+  img: HTMLImageElement
+  bytes: number
+}
 
 /**
- * tile 缓存：key = `${sessionId}:${z}:${x}:${y}` → HTMLImageElement。
+ * tile 缓存：key = `${sessionId}:${z}:${x}:${y}` → TileCacheEntry。
  * 使用 insertion-order Map 模拟 LRU（每次访问时 delete+set 移到末尾）。
  */
-const tileCache = new Map<string, HTMLImageElement>()
+const tileCache = new Map<string, TileCacheEntry>()
+let tileCacheBytes = 0
+let pinnedKeys = new Set<string>()
 
 /** 正在加载的 tile key 集合，防止重复发起请求。 */
 const loadingTiles = new Set<string>()
@@ -73,20 +83,11 @@ let selectedLevel: number | null = null
 
 // ─── 工具函数 ─────────────────────────────────────────────────────
 
-/** 按当前物理采样倍率选择 Phase 1A 可渲染层。 */
+/** 按当前物理采样倍率选择完整金字塔层级。 */
 function selectLevel(): number {
   const dpr = window.devicePixelRatio || 1
   const effScale = zoom.value * dpr
-  const ideal = Math.floor(Math.log2(1 / Math.max(effScale, 1e-6)))
-  const maxRenderable = Math.min(1, props.session.maxLevel)
-  const clampedIdeal = Math.min(Math.max(ideal, 0), maxRenderable)
-  if (selectedLevel === null || selectedLevel > maxRenderable || selectedLevel === clampedIdeal) {
-    return clampedIdeal
-  }
-  // Phase 1A 仅有 level0/1，在 0.5 临界点两侧保留 0.05 死区，避免逐帧翻转。
-  if (selectedLevel === 0 && clampedIdeal === 1 && effScale >= 0.45) return selectedLevel
-  if (selectedLevel === 1 && clampedIdeal === 0 && effScale <= 0.55) return selectedLevel
-  return clampedIdeal
+  return pickLevel(effScale, selectedLevel, props.session.maxLevel)
 }
 
 function tileKey(z: number, tx: number, ty: number): string {
@@ -106,24 +107,8 @@ function levelDimensions(level: number) {
  * 由视口和 zoom/offset 计算图像坐标系可见矩形。
  */
 function computeVisibleRect() {
-  const { width: vpW, height: vpH } = viewport.value
-  const z = zoom.value
-  const ox = offset.value.x
-  const oy = offset.value.y
   const { width: imgW, height: imgH } = props.session
-
-  // canvas 左上角对应的图像坐标（CSS px 坐标系）
-  const imgX0 = -ox / z
-  const imgY0 = -oy / z
-  const imgX1 = (vpW - ox) / z
-  const imgY1 = (vpH - oy) / z
-
-  return {
-    imgX: Math.max(0, imgX0),
-    imgY: Math.max(0, imgY0),
-    imgX1: Math.min(imgW, imgX1),
-    imgY1: Math.min(imgH, imgY1),
-  }
+  return visibleImageRect(viewport.value, zoom.value, offset.value, rotation.value, imgW, imgH)
 }
 
 /**
@@ -153,15 +138,31 @@ function computeVisibleTileRange(
 
 /**
  * 向 Map LRU 末尾移动 key（模拟 access）。
- * 超出上限时删除最旧的条目。
+ * 超出字节预算时删除最旧的条目。
  */
+function tileCacheLimitBytes(): number {
+  const configuredBytes = settingsStore.settings.cache.memoryCacheLimitMB * 1024 * 1024
+  const requiredTileCount = Math.floor(TILE_CACHE_LIMIT * 0.7 + COARSE_TILE_MARGIN)
+  const requiredBytes = requiredTileCount * props.session.tileSize * props.session.tileSize * 4
+  return Math.max(configuredBytes * TILE_CACHE_RATIO, requiredBytes)
+}
+
+function estimateTileBytes(img: HTMLImageElement): number {
+  const width = img.naturalWidth || props.session.tileSize
+  const height = img.naturalHeight || props.session.tileSize
+  return width * height * 4
+}
+
 function lruAccess(key: string, img: HTMLImageElement) {
-  if (tileCache.has(key)) tileCache.delete(key)
-  tileCache.set(key, img)
-  if (tileCache.size > TILE_CACHE_LIMIT) {
-    const oldest = tileCache.keys().next().value
-    if (oldest !== undefined) tileCache.delete(oldest)
+  const previous = tileCache.get(key)
+  if (previous) {
+    tileCacheBytes -= previous.bytes
+    tileCache.delete(key)
   }
+  const entry = { img, bytes: estimateTileBytes(img) }
+  tileCache.set(key, entry)
+  tileCacheBytes += entry.bytes
+  tileCacheBytes = evictByBytes(tileCache, tileCacheBytes, tileCacheLimitBytes(), pinnedKeys)
 }
 
 /**
@@ -248,6 +249,7 @@ function scheduleRender() {
 
 /** 核心渲染函数（在 rAF 中调用）。 */
 function render() {
+  pinnedKeys = new Set<string>()
   const canvas = canvasRef.value
   if (!canvas) return
 
@@ -291,18 +293,60 @@ function render() {
     )
     ctx.save()
     applySourceTransform()
+    const transform = ctx.getTransform()
+    const alignSourceBoundary = (
+      coordinate: number,
+      xCoefficient: number,
+      yCoefficient: number,
+    ) => {
+      if (xCoefficient !== 0) {
+        return (Math.round(transform.e + xCoefficient * coordinate) - transform.e) / xCoefficient
+      }
+      return (Math.round(transform.f + yCoefficient * coordinate) - transform.f) / yCoefficient
+    }
     for (let ty = ty0; ty <= ty1; ty++) {
       for (let tx = tx0; tx <= tx1; tx++) {
-        const cached = tileCache.get(tileKey(level, tx, ty))
+        const key = tileKey(level, tx, ty)
+        const cached = tileCache.get(key)
         if (!cached) continue
+        lruAccess(key, cached.img)
         const levelX = tx * tileSize
         const levelY = ty * tileSize
         const tileW = Math.min(tileSize, width - levelX)
         const tileH = Math.min(tileSize, height - levelY)
-        ctx.drawImage(cached, levelX * scale, levelY * scale, tileW * scale, tileH * scale)
+        // fix(Task5)：先统一整数原图边界，再经当前旋转变换吸附到共享 device pixel 边界。
+        const imageX0 = alignSourceBoundary(Math.round(levelX * scale), transform.a, transform.b)
+        const imageY0 = alignSourceBoundary(Math.round(levelY * scale), transform.c, transform.d)
+        const imageX1 = alignSourceBoundary(
+          Math.round(Math.min(imgW, (levelX + tileW) * scale)),
+          transform.a,
+          transform.b,
+        )
+        const imageY1 = alignSourceBoundary(
+          Math.round(Math.min(imgH, (levelY + tileH) * scale)),
+          transform.c,
+          transform.d,
+        )
+        ctx.drawImage(cached.img, imageX0, imageY0, imageX1 - imageX0, imageY1 - imageY0)
       }
     }
     ctx.restore()
+  }
+
+  const pinTileLevel = (level: number, visRect: ReturnType<typeof computeVisibleRect>) => {
+    const { tx0, ty0, tx1, ty1 } = computeVisibleTileRange(
+      level,
+      visRect.imgX,
+      visRect.imgY,
+      visRect.imgX1,
+      visRect.imgY1,
+    )
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const key = tileKey(level, tx, ty)
+        if (tileCache.has(key)) pinnedKeys.add(key)
+      }
+    }
   }
 
   // ── 底层：preview（拉伸到当前视口对应区域，作为 fallback）──────────
@@ -313,15 +357,13 @@ function render() {
     ctx.restore()
   }
 
-  // 旋转 LOD 留到 Phase 1B，本期保持 preview-only。
-  if (!props.session.tileable || rotation.value !== 0) return
+  if (!props.session.tileable) return
 
   // ── 上层：已缓存粗层兜底，再叠加目标层 ─────────────────────────
   const visRect = computeVisibleRect()
   const targetLevel = selectLevel()
   selectedLevel = targetLevel
-  const maxRenderable = Math.min(1, props.session.maxLevel)
-  if (targetLevel < maxRenderable) renderTileLevel(targetLevel + 1, visRect)
+  const maxRenderable = props.session.maxLevel
 
   const { tx0, ty0, tx1, ty1 } = computeVisibleTileRange(
     targetLevel,
@@ -333,6 +375,11 @@ function render() {
   const visibleTileCount = Math.max(0, tx1 - tx0 + 1) * Math.max(0, ty1 - ty0 + 1)
   const exceedsTileBudget = targetLevel === maxRenderable
     && visibleTileCount > Math.floor(TILE_CACHE_LIMIT * 0.7)
+
+  // 绘制前统一 pin 粗层与目标层，避免粗层 LRU 访问淘汰本帧稍后才绘制的目标 tile。
+  if (targetLevel < maxRenderable) pinTileLevel(targetLevel + 1, visRect)
+  if (!exceedsTileBudget) pinTileLevel(targetLevel, visRect)
+  if (targetLevel < maxRenderable) renderTileLevel(targetLevel + 1, visRect)
   if (exceedsTileBudget) return
 
   renderTileLevel(targetLevel, visRect)
@@ -420,6 +467,7 @@ watch(() => props.session, (newSession, oldSession) => {
     previewImg.value?.close()
     previewImg.value = null
     tileCache.clear()
+    tileCacheBytes = 0
     clearRetryState()
     selectedLevel = null
     firstTileReported = false
@@ -447,6 +495,7 @@ onBeforeUnmount(() => {
   if (rafHandle !== null) cancelAnimationFrame(rafHandle)
   resizeObserver?.disconnect()
   tileCache.clear()
+  tileCacheBytes = 0
   clearRetryState()
   cancelInflightImages()
   previewImg.value?.close()
