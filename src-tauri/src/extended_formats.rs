@@ -28,8 +28,45 @@ pub fn is_tiff(path: &Path) -> bool {
     TIFF_EXTENSIONS.contains(&extension(path).as_str())
 }
 
+/// 已知 HEIF/HEIC/AVIF 的 ISO-BMFF 品牌（major + compatible brands）。
+const HEIF_BRANDS: [&[u8; 4]; 12] = [
+    b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1",
+    b"avif", b"avis",
+];
+
+/// 通过文件头嗅探 ISO-BMFF（HEIF/HEIC/AVIF）容器，以处理扩展名与内容不符的情况
+/// （例如 iPhone 导出的 `.png` 实为 HEIF，需走系统解码而非 image-rs）。
+pub fn is_heif_content(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 32];
+    let Ok(read) = file.read(&mut header) else {
+        return false;
+    };
+    // ISO-BMFF：bytes[4..8] == "ftyp"，major brand 在 [8..12]，compatible brands 从 16 起每 4 字节。
+    if read < 12 || &header[4..8] != b"ftyp" {
+        return false;
+    }
+    if HEIF_BRANDS.iter().any(|brand| brand.as_slice() == &header[8..12]) {
+        return true;
+    }
+    let mut offset = 16;
+    while offset + 4 <= read {
+        if HEIF_BRANDS
+            .iter()
+            .any(|brand| brand.as_slice() == &header[offset..offset + 4])
+        {
+            return true;
+        }
+        offset += 4;
+    }
+    false
+}
+
 pub fn is_system_decoded(path: &Path) -> bool {
-    is_tiff(path) || SYSTEM_EXTENSIONS.contains(&extension(path).as_str())
+    is_tiff(path) || SYSTEM_EXTENSIONS.contains(&extension(path).as_str()) || is_heif_content(path)
 }
 
 pub fn is_raw(path: &Path) -> bool {
@@ -243,6 +280,27 @@ Image.new("RGB", (8, 6), (120, 40, 200)).save(sys.argv[1], format="TIFF", compre
         assert!(!needs_colorsync_output(Path::new("sample.png")));
         assert!(needs_colorsync_output(Path::new("sample.tiff")));
         assert!(needs_colorsync_output(Path::new("sample.heic")));
+    }
+
+    #[test]
+    fn heif_content_is_detected_regardless_of_extension() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 扩展名是 .png，内容却是 HEIF（iPhone 导出常见）：ftyp + heic 品牌。
+        let mislabeled = dir.path().join("IMG.png");
+        let mut header = vec![0x00, 0x00, 0x00, 0x18];
+        header.extend_from_slice(b"ftypheic");
+        header.extend_from_slice(b"\0\0\0\0mif1heic");
+        std::fs::write(&mislabeled, &header).unwrap();
+        assert!(is_heif_content(&mislabeled));
+        assert!(is_system_decoded(&mislabeled));
+        assert!(needs_colorsync_output(&mislabeled));
+
+        // 真正的 PNG 内容不应被误判。
+        let real_png = dir.path().join("real.png");
+        std::fs::write(&real_png, b"\x89PNG\r\n\x1a\n........").unwrap();
+        assert!(!is_heif_content(&real_png));
+        assert!(!is_system_decoded(&real_png));
     }
 
     #[test]
