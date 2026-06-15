@@ -32,6 +32,8 @@ export interface AppSettings {
     tileSize: 256 | 512 | 1024
     enableTilePrefetch: boolean
     prefetchRadius: number
+    pyramidDiskCacheMB: number
+    neighborPrefetchCount: number
   }
   cache: {
     memoryCacheLimitMB: number

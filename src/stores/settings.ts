@@ -29,6 +29,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
     tileSize: 512,
     enableTilePrefetch: true,
     prefetchRadius: 1,
+    pyramidDiskCacheMB: 1024,
+    neighborPrefetchCount: 1,
   },
   cache: {
     memoryCacheLimitMB: 512,

@@ -19,6 +19,7 @@ import { useViewerStore } from '@/stores/viewer'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useLargeImage } from '@/composables/useLargeImage'
 import { useFileOperations } from '@/composables/useFileOperations'
+import { collectNeighborPaths } from '@/utils/neighborPaths'
 import { eventToChord, resolveAction, type ActionId } from '@/utils/shortcuts'
 import type { ImageEntry } from '@/types/image'
 
@@ -98,9 +99,16 @@ watch(
   () => {
     // 改为监听 currentEntry.path，切换图片时立即预加载，无需等待 loading 翻转
     const count = settings.value.performance.preloadNormalCount
-    if (count <= 0) return
     const entries = directoryStore.entries
     const idx = directoryStore.currentIndex
+
+    // 邻居大图金字塔由后端子线程预建，不创建 <img>，避免 WebView 主线程解码大图
+    const pyramidPaths = collectNeighborPaths(entries, idx, settings.value.largeImage.neighborPrefetchCount)
+    if (pyramidPaths.length > 0) {
+      void invoke('prefetch_large_pyramid', { paths: pyramidPaths }).catch(() => {})
+    }
+
+    if (count <= 0) return
 
     // 本次需要的邻居（去重，保留 entry 以便按格式/尺寸判定）
     const needed = new Set<string>()
