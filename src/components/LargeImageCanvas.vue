@@ -48,33 +48,58 @@ const previewLoaded = shallowRef(false)
 const TILE_CACHE_LIMIT = 256
 
 /**
- * tile 缓存：key = `${sessionId}:${x}:${y}` → HTMLImageElement。
+ * tile 缓存：key = `${sessionId}:${z}:${x}:${y}` → HTMLImageElement。
  * 使用 insertion-order Map 模拟 LRU（每次访问时 delete+set 移到末尾）。
  */
 const tileCache = new Map<string, HTMLImageElement>()
 
 /** 正在加载的 tile key 集合，防止重复发起请求。 */
 const loadingTiles = new Set<string>()
-/** 加载失败的 tile 负缓存，避免每帧重复请求。 */
-const failedTiles = new Set<string>()
+/** 到达重试上限后才永久停止请求。 */
+const permanentFailedTiles = new Set<string>()
+/** 短期失败的退避状态。 */
+const tileRetry = new Map<string, { attempts: number, nextAt: number }>()
+/** 确保无交互时，到退避时间也能触发下一次请求。 */
+const retryTimers = new Map<string, number>()
 /** 跟踪在途 Image，卸载或切会话时解除回调。 */
 const inflightImages = new Set<HTMLImageElement>()
+const MAX_RETRY = 6
 
 // ─── rAF 状态 ─────────────────────────────────────────────────────
 let rafHandle: number | null = null
 let renderScheduled = false
 let firstTileReported = false // 防止重复上报首屏 tile 数
+let selectedLevel: number | null = null
 
 // ─── 工具函数 ─────────────────────────────────────────────────────
 
-/**
- * 计算当前 session 的 previewScale：
- * 实际预览像素宽 / 图像宽（等价于预览缩放比）。
- * zoom 超过此值时 preview 不够清晰，需要 tile 补充。
- */
-function computePreviewScale(): number {
-  const { width, previewW } = props.session
-  return width > 0 ? previewW / width : 1
+/** 按当前物理采样倍率选择 Phase 1A 可渲染层。 */
+function selectLevel(): number {
+  const dpr = window.devicePixelRatio || 1
+  const effScale = zoom.value * dpr
+  const ideal = Math.floor(Math.log2(1 / Math.max(effScale, 1e-6)))
+  const maxRenderable = Math.min(1, props.session.maxLevel)
+  const clampedIdeal = Math.min(Math.max(ideal, 0), maxRenderable)
+  if (selectedLevel === null || selectedLevel > maxRenderable || selectedLevel === clampedIdeal) {
+    return clampedIdeal
+  }
+  // Phase 1A 仅有 level0/1，在 0.5 临界点两侧保留 0.05 死区，避免逐帧翻转。
+  if (selectedLevel === 0 && clampedIdeal === 1 && effScale >= 0.45) return selectedLevel
+  if (selectedLevel === 1 && clampedIdeal === 0 && effScale <= 0.55) return selectedLevel
+  return clampedIdeal
+}
+
+function tileKey(z: number, tx: number, ty: number): string {
+  return `${props.session.sessionId}:${z}:${tx}:${ty}`
+}
+
+function levelDimensions(level: number) {
+  const scale = 2 ** level
+  return {
+    scale,
+    width: Math.ceil(props.session.width / scale),
+    height: Math.ceil(props.session.height / scale),
+  }
 }
 
 /**
@@ -105,16 +130,24 @@ function computeVisibleRect() {
  * 由可见矩形计算命中的 tile 网格范围。
  * 返回 { tx0, ty0, tx1, ty1 }（tile 坐标，inclusive）。
  */
-function computeVisibleTileRange(imgX: number, imgY: number, imgX1: number, imgY1: number) {
-  const { tileSize, width: imgW, height: imgH } = props.session
-  const tilesX = Math.ceil(imgW / tileSize)
-  const tilesY = Math.ceil(imgH / tileSize)
+function computeVisibleTileRange(
+  level: number,
+  imgX: number,
+  imgY: number,
+  imgX1: number,
+  imgY1: number,
+) {
+  const { tileSize } = props.session
+  const { scale, width, height } = levelDimensions(level)
+  const tilesX = Math.ceil(width / tileSize)
+  const tilesY = Math.ceil(height / tileSize)
+  const tileSpan = tileSize * scale
 
   return {
-    tx0: Math.max(0, Math.floor(imgX / tileSize)),
-    ty0: Math.max(0, Math.floor(imgY / tileSize)),
-    tx1: Math.min(tilesX - 1, Math.floor((imgX1 - 1) / tileSize)),
-    ty1: Math.min(tilesY - 1, Math.floor((imgY1 - 1) / tileSize)),
+    tx0: Math.max(0, Math.floor(imgX / tileSpan)),
+    ty0: Math.max(0, Math.floor(imgY / tileSpan)),
+    tx1: Math.min(tilesX - 1, Math.floor((imgX1 - 1) / tileSpan)),
+    ty1: Math.min(tilesY - 1, Math.floor((imgY1 - 1) / tileSpan)),
   }
 }
 
@@ -137,21 +170,31 @@ function lruAccess(key: string, img: HTMLImageElement) {
  * - 正在加载中 → 跳过（onload 回调会触发重绘）
  * - 其他 → 发起 new Image() 请求
  */
-function loadTile(tx: number, ty: number) {
+function loadTile(z: number, tx: number, ty: number) {
   const { sessionId } = props.session
-  const key = `${sessionId}:${tx}:${ty}`
+  const key = tileKey(z, tx, ty)
+  const retry = tileRetry.get(key)
 
-  if (tileCache.has(key) || loadingTiles.has(key) || failedTiles.has(key)) return
+  if (
+    tileCache.has(key)
+    || loadingTiles.has(key)
+    || permanentFailedTiles.has(key)
+    || (retry && Date.now() < retry.nextAt)
+  ) return
 
+  const retryTimer = retryTimers.get(key)
+  if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+  retryTimers.delete(key)
   loadingTiles.add(key)
   const img = new Image()
   inflightImages.add(img)
-  img.src = tileUrl(sessionId, tx, ty)
 
   img.onload = () => {
     loadingTiles.delete(key)
     inflightImages.delete(img)
     if (props.session.sessionId !== sessionId) return
+    tileRetry.delete(key)
+    permanentFailedTiles.delete(key)
     lruAccess(key, img)
     scheduleRender()
   }
@@ -159,9 +202,22 @@ function loadTile(tx: number, ty: number) {
   img.onerror = () => {
     loadingTiles.delete(key)
     inflightImages.delete(img)
-    failedTiles.add(key)
-    console.warn(`[PicSee] tile load error: ${key}`)
+    if (props.session.sessionId !== sessionId) return
+    const attempts = (tileRetry.get(key)?.attempts ?? 0) + 1
+    if (attempts >= MAX_RETRY) {
+      tileRetry.delete(key)
+      permanentFailedTiles.add(key)
+      console.warn(`[PicSee] tile load abandoned after ${attempts} attempts: ${key}`)
+      return
+    }
+    const delay = Math.min(2000, 150 * 2 ** (attempts - 1))
+    tileRetry.set(key, { attempts, nextAt: Date.now() + delay })
+    retryTimers.set(key, window.setTimeout(() => {
+      retryTimers.delete(key)
+      scheduleRender()
+    }, delay))
   }
+  img.src = tileUrl(sessionId, z, tx, ty)
 }
 
 function cancelInflightImages() {
@@ -170,6 +226,14 @@ function cancelInflightImages() {
     img.onerror = null
   }
   inflightImages.clear()
+  loadingTiles.clear()
+}
+
+function clearRetryState() {
+  for (const timer of retryTimers.values()) window.clearTimeout(timer)
+  retryTimers.clear()
+  tileRetry.clear()
+  permanentFailedTiles.clear()
 }
 
 /** 请求 rAF 重绘（合批：同一帧内多次调用只触发一次）。 */
@@ -215,6 +279,32 @@ function render() {
     else ctx.setTransform(s, 0, 0, s, ox * dpr, oy * dpr)
   }
 
+  const renderTileLevel = (level: number, visRect: ReturnType<typeof computeVisibleRect>) => {
+    const { tileSize } = props.session
+    const { scale, width, height } = levelDimensions(level)
+    const { tx0, ty0, tx1, ty1 } = computeVisibleTileRange(
+      level,
+      visRect.imgX,
+      visRect.imgY,
+      visRect.imgX1,
+      visRect.imgY1,
+    )
+    ctx.save()
+    applySourceTransform()
+    for (let ty = ty0; ty <= ty1; ty++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const cached = tileCache.get(tileKey(level, tx, ty))
+        if (!cached) continue
+        const levelX = tx * tileSize
+        const levelY = ty * tileSize
+        const tileW = Math.min(tileSize, width - levelX)
+        const tileH = Math.min(tileSize, height - levelY)
+        ctx.drawImage(cached, levelX * scale, levelY * scale, tileW * scale, tileH * scale)
+      }
+    }
+    ctx.restore()
+  }
+
   // ── 底层：preview（拉伸到当前视口对应区域，作为 fallback）──────────
   if (previewLoaded.value && previewImg.value) {
     ctx.save()
@@ -223,76 +313,63 @@ function render() {
     ctx.restore()
   }
 
-  // ── 上层：tile（已缓存的直接画，避免闪烁）───────────────────────
+  // 旋转 LOD 留到 Phase 1B，本期保持 preview-only。
+  if (!props.session.tileable || rotation.value !== 0) return
+
+  // ── 上层：已缓存粗层兜底，再叠加目标层 ─────────────────────────
   const visRect = computeVisibleRect()
+  const targetLevel = selectLevel()
+  selectedLevel = targetLevel
+  const maxRenderable = Math.min(1, props.session.maxLevel)
+  if (targetLevel < maxRenderable) renderTileLevel(targetLevel + 1, visRect)
+
   const { tx0, ty0, tx1, ty1 } = computeVisibleTileRange(
-    visRect.imgX, visRect.imgY, visRect.imgX1, visRect.imgY1,
+    targetLevel,
+    visRect.imgX,
+    visRect.imgY,
+    visRect.imgX1,
+    visRect.imgY1,
   )
   const visibleTileCount = Math.max(0, tx1 - tx0 + 1) * Math.max(0, ty1 - ty0 + 1)
-  const previewScale = computePreviewScale()
-  const needTiles = props.session.tileable
-    && rotation.value === 0
-    && zoom.value * dpr > previewScale
-    // TODO M6：引入 z 级 LOD 后移除此低倍率保护。
-    && visibleTileCount <= Math.floor(TILE_CACHE_LIMIT * 0.7)
+  const exceedsTileBudget = targetLevel === maxRenderable
+    && visibleTileCount > Math.floor(TILE_CACHE_LIMIT * 0.7)
+  if (exceedsTileBudget) return
 
-  if (needTiles) {
-    for (let ty = ty0; ty <= ty1; ty++) {
-      for (let tx = tx0; tx <= tx1; tx++) {
-        const { sessionId } = props.session
-        const key = `${sessionId}:${tx}:${ty}`
-        const cached = tileCache.get(key)
-        if (!cached) continue
+  renderTileLevel(targetLevel, visRect)
 
-        // tile 在图像坐标系中的像素位置
-        const tileX = tx * tileSize
-        const tileY = ty * tileSize
-        const tileW = Math.min(tileSize, imgW - tileX)
-        const tileH = Math.min(tileSize, imgH - tileY)
-
-        ctx.save()
-        applySourceTransform()
-        ctx.drawImage(cached, tileX, tileY, tileW, tileH)
-        ctx.restore()
-      }
+  let firstScreenTileCount = 0
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      loadTile(targetLevel, tx, ty)
+      firstScreenTileCount++
+    }
+  }
+  if (firstScreenTileCount > 0 && !firstTileReported) {
+    firstTileReported = true
+    const tileMsg = `首屏 tile 数: ${firstScreenTileCount} (z=${targetLevel},tx0=${tx0},ty0=${ty0},tx1=${tx1},ty1=${ty1})`
+    if (import.meta.env.DEV) console.log(`[PicSee] ${tileMsg}`)
+    // TODO M4-debug：上报首屏 tile 数
+    if (import.meta.env.DEV) {
+      void fetch('/__picsee_e2e_result', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'first_screen_tiles', count: firstScreenTileCount, tx0, ty0, tx1, ty1 }),
+      }).catch(() => {})
     }
   }
 
-  if (needTiles) {
-    let firstScreenTileCount = 0
-    for (let ty = ty0; ty <= ty1; ty++) {
-      for (let tx = tx0; tx <= tx1; tx++) {
-        loadTile(tx, ty)
-        firstScreenTileCount++
-      }
-    }
-    if (firstScreenTileCount > 0 && !firstTileReported) {
-      firstTileReported = true
-      const tileMsg = `首屏 tile 数: ${firstScreenTileCount} (tx0=${tx0},ty0=${ty0},tx1=${tx1},ty1=${ty1})`
-      if (import.meta.env.DEV) console.log(`[PicSee] ${tileMsg}`)
-      // TODO M4-debug：上报首屏 tile 数
-      if (import.meta.env.DEV) {
-        void fetch('/__picsee_e2e_result', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event: 'first_screen_tiles', count: firstScreenTileCount, tx0, ty0, tx1, ty1 }),
-        }).catch(() => {})
-      }
-    }
+  // ── tile 预取（可见范围外扩 prefetchRadius 圈）──────────────
+  const settings = settingsStore.settings.largeImage
+  if (settings.enableTilePrefetch && settings.prefetchRadius > 0) {
+    const r = settings.prefetchRadius
+    const level = levelDimensions(targetLevel)
+    const maxTX = Math.ceil(level.width / tileSize) - 1
+    const maxTY = Math.ceil(level.height / tileSize) - 1
 
-    // ── tile 预取（可见范围外扩 prefetchRadius 圈）──────────────
-    const settings = settingsStore.settings.largeImage
-    if (settings.enableTilePrefetch && settings.prefetchRadius > 0) {
-      const r = settings.prefetchRadius
-      const maxTX = Math.ceil(imgW / tileSize) - 1
-      const maxTY = Math.ceil(imgH / tileSize) - 1
-
-      for (let ty = Math.max(0, ty0 - r); ty <= Math.min(maxTY, ty1 + r); ty++) {
-        for (let tx = Math.max(0, tx0 - r); tx <= Math.min(maxTX, tx1 + r); tx++) {
-          // 跳过已在可见范围内的（已在上面加载）
-          if (tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1) continue
-          loadTile(tx, ty)
-        }
+    for (let ty = Math.max(0, ty0 - r); ty <= Math.min(maxTY, ty1 + r); ty++) {
+      for (let tx = Math.max(0, tx0 - r); tx <= Math.min(maxTX, tx1 + r); tx++) {
+        if (tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1) continue
+        loadTile(targetLevel, tx, ty)
       }
     }
   }
@@ -343,8 +420,8 @@ watch(() => props.session, (newSession, oldSession) => {
     previewImg.value?.close()
     previewImg.value = null
     tileCache.clear()
-    loadingTiles.clear()
-    failedTiles.clear()
+    clearRetryState()
+    selectedLevel = null
     firstTileReported = false
     loadPreview()
     scheduleRender()
@@ -370,8 +447,7 @@ onBeforeUnmount(() => {
   if (rafHandle !== null) cancelAnimationFrame(rafHandle)
   resizeObserver?.disconnect()
   tileCache.clear()
-  loadingTiles.clear()
-  failedTiles.clear()
+  clearRetryState()
   cancelInflightImages()
   previewImg.value?.close()
 })

@@ -31,9 +31,8 @@ export function previewUrl(sessionId: number): string {
 
 /**
  * 拼接 tile URL。
- * 格式：{base}/tile/{sessionId}/0/{x}/{y}
- * z 固定为 0（原始分辨率；多级 LOD 在后续里程碑实现）。
+ * 格式：{base}/tile/{sessionId}/{z}/{x}/{y}
  */
-export function tileUrl(sessionId: number, x: number, y: number): string {
-  return `${picseeBase()}/tile/${sessionId}/0/${x}/${y}`
+export function tileUrl(sessionId: number, z: number, x: number, y: number): string {
+  return `${picseeBase()}/tile/${sessionId}/${z}/${x}/${y}`
 }

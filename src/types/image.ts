@@ -61,6 +61,8 @@ export interface OpenLargeImageResult {
   previewMaxSize: number
   tileable: boolean
   rawPreview: boolean
+  /** 最小的整层可放入单个 tile 的 LOD 层级。 */
+  maxLevel: number
   /** 预览图像素宽（前端按此构造 ImageData）。 */
   previewW: number
   /** 预览图像素高。 */
