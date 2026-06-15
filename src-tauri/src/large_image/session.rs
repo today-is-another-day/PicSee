@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
@@ -39,6 +39,10 @@ const NAV_PREVIEW_CAP: u32 = 384;
 /// 非 BMP 大图落临时栅格的像素上限：超过则退化为仅预览，避免一次性解码 OOM。
 /// 100M 像素 ≈ 解码峰值数百 MB，权衡内存预算与可视化收益。
 const MAX_RASTER_PIXELS: u64 = 100_000_000;
+
+/// 同层构建 claim 的等待间隔与上界，总等待约 2 秒。
+const LEVEL_CLAIM_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+const LEVEL_CLAIM_WAIT_MAX_POLLS: u32 = 400;
 
 /// 临时栅格文件序号（保证文件名唯一）。
 static RASTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -80,6 +84,8 @@ pub struct ImageSession {
     pub levels: Mutex<Vec<Arc<LevelSource>>>,
     /// 会话关闭或逐出后通知后台停止发布新层。
     pub build_cancelled: Arc<AtomicBool>,
+    /// 正在构建的层级，避免后台全量构建与按需请求重复写同一层。
+    pub building_levels: Arc<Mutex<HashSet<u32>>>,
     /// 待落盘的已解码图（非 BMP 大图）：open 时不写栅格、先返回预览，
     /// 首个瓦片请求或后台任务调用 ensure_raster 时写盘并释放此图。None 表示无需/已完成。
     pub pending_raster: Mutex<Option<image::DynamicImage>>,
@@ -441,8 +447,67 @@ fn ensure_raster(session: &ImageSession) -> Result<(), LargeImageError> {
     }
 }
 
-/// 确保指定层已完整生成；Phase 1A 只调度 level1，但保留依赖链生成能力。
+/// 层构建 claim；离开作用域或 panic 展开时自动释放。
+struct LevelBuildClaim {
+    building_levels: Arc<Mutex<HashSet<u32>>>,
+    level: u32,
+}
+
+impl Drop for LevelBuildClaim {
+    fn drop(&mut self) {
+        self.building_levels.lock().unwrap().remove(&self.level);
+    }
+}
+
+/// 抢占指定层的构建权。
+fn claim_level_build(session: &ImageSession, level: u32) -> Option<LevelBuildClaim> {
+    let building_levels = session.building_levels.clone();
+    if !building_levels.lock().unwrap().insert(level) {
+        return None;
+    }
+    Some(LevelBuildClaim {
+        building_levels,
+        level,
+    })
+}
+
+/// 确保指定层已完整生成；同层并发调用只允许一个实际构建者。
 fn ensure_level(session: &ImageSession, level: u32) -> Result<(), LargeImageError> {
+    if level > session.max_level {
+        return Err(LargeImageError::io(format!(
+            "level index out of range: {level} > {}",
+            session.max_level
+        )));
+    }
+    for poll in 0..LEVEL_CLAIM_WAIT_MAX_POLLS {
+        if session.build_cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if level > 0 {
+            let ready = {
+                let levels = session.levels.lock().unwrap();
+                levels[level as usize].ready.load(Ordering::Acquire)
+            };
+            if ready {
+                return Ok(());
+            }
+        }
+        if let Some(_claim) = claim_level_build(session, level) {
+            return ensure_level_inner(session, level);
+        }
+        if poll + 1 == LEVEL_CLAIM_WAIT_MAX_POLLS {
+            break;
+        }
+        // 同层由其他任务构建时等待其发布；依赖方向只向更细层，不形成循环等待。
+        std::thread::sleep(LEVEL_CLAIM_WAIT_INTERVAL);
+    }
+    Err(LargeImageError::io(format!(
+        "timed out waiting for pyramid level {level} build claim"
+    )))
+}
+
+/// 已持有当前层构建权时执行构建，依赖层通过 `ensure_level` 单独去重。
+fn ensure_level_inner(session: &ImageSession, level: u32) -> Result<(), LargeImageError> {
     if session.build_cancelled.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -472,7 +537,10 @@ fn ensure_level(session: &ImageSession, level: u32) -> Result<(), LargeImageErro
         levels[level as usize - 1].clone()
     };
     if !source.ready.load(Ordering::Acquire) {
-        return Ok(());
+        return Err(LargeImageError::io(format!(
+            "pyramid dependency level {} is not ready",
+            level - 1
+        )));
     }
     if target.path.as_os_str().is_empty() {
         return Err(LargeImageError::io("没有可用的金字塔缓存目录"));
@@ -509,6 +577,20 @@ fn ensure_level(session: &ImageSession, level: u32) -> Result<(), LargeImageErro
     });
     session.levels.lock().unwrap()[level as usize] = ready_level;
     Ok(())
+}
+
+/// 按需触发层构建；只有成功抢占该层时才创建后台任务。
+fn spawn_level_build(session: Arc<ImageSession>, level: u32) {
+    if session.build_cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(_claim) = claim_level_build(&session, level) else {
+        return;
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _claim = _claim;
+        let _ = ensure_level_inner(&session, level);
+    });
 }
 
 /// 最近邻把 RGBA 缩到最长边 ≤ cap，返回 (rgba, w, h)。
@@ -690,6 +772,7 @@ pub fn handle_tile_request(
         .cloned()
         .ok_or_else(|| (400, LargeImageError::tile_out_of_range(tile_x, tile_y)))?;
     if !level.ready.load(Ordering::Acquire) {
+        spawn_level_build(session.clone(), z);
         return Err((
             425,
             LargeImageError::new("LEVEL_NOT_READY", format!("Level {z} is not ready")),
@@ -932,6 +1015,7 @@ pub async fn open_large_image(
         max_level,
         levels: Mutex::new(levels),
         build_cancelled: Arc::new(AtomicBool::new(false)),
+        building_levels: Arc::new(Mutex::new(HashSet::new())),
         preview_rgba,
         nav_preview_webp,
         pending_raster: Mutex::new(pending_img),
@@ -949,7 +1033,7 @@ pub async fn open_large_image(
         preview_h,
     };
     // 非 BMP 大图：后台尽快写栅格（即使用户不放大也释放整图内存；首个瓦片请求亦会触发 ensure_raster）。
-    let bg_level1_session = if tileable
+    let bg_pyramid_session = if tileable
         && max_level >= 1
         && !session.levels.lock().unwrap()[1]
             .path
@@ -960,7 +1044,7 @@ pub async fn open_large_image(
     } else {
         None
     };
-    let bg_raster_session = if bg_level1_session.is_none() && tile_source_is_temp {
+    let bg_raster_session = if bg_pyramid_session.is_none() && tile_source_is_temp {
         Some(session.clone())
     } else {
         None
@@ -970,9 +1054,14 @@ pub async fn open_large_image(
     for temp in evicted_temps {
         let _ = std::fs::remove_file(temp);
     }
-    if let Some(session) = bg_level1_session {
+    if let Some(session) = bg_pyramid_session {
         tauri::async_runtime::spawn_blocking(move || {
-            let _ = ensure_level(&session, 1);
+            for level in 1..=session.max_level {
+                if session.build_cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = ensure_level(&session, level);
+            }
         });
     } else if let Some(session) = bg_raster_session {
         tauri::async_runtime::spawn_blocking(move || {
@@ -1107,37 +1196,203 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_level_builds_and_publishes_level1() {
+    fn test_ensure_level_builds_and_publishes_dependency_chain() {
         let directory = tempfile::tempdir_in(".").unwrap();
         let source = directory.path().join("source.bmp");
-        let rgba = vec![20u8, 40, 60, 255].repeat(4 * 4);
-        write_temp_bmp_raster(&rgba, 4, 4, 4, &source).unwrap();
-        let levels = make_level_sources(7, 4, 4, 1, source.clone(), false, Some(directory.path()));
+        let rgba = vec![20u8, 40, 60, 255].repeat(100 * 100);
+        write_temp_bmp_raster(&rgba, 4, 100, 100, &source).unwrap();
+        let levels = make_level_sources(
+            7,
+            100,
+            100,
+            3,
+            source.clone(),
+            false,
+            Some(directory.path()),
+        );
         let session = ImageSession {
             session_id: 7,
             path: source.clone(),
-            width: 4,
-            height: 4,
-            tile_size: 2,
-            preview_max_size: 4,
+            width: 100,
+            height: 100,
+            tile_size: 16,
+            preview_max_size: 100,
             tileable: true,
             raw_preview: false,
             tile_source_path: source,
             tile_source_is_temp: false,
-            max_level: 1,
+            max_level: 3,
             levels: Mutex::new(levels),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            building_levels: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_raster: Mutex::new(None),
             preview_rgba: vec![],
             nav_preview_webp: vec![],
         };
 
-        ensure_level(&session, 1).unwrap();
+        ensure_level(&session, 3).unwrap();
 
-        let level = session.levels.lock().unwrap()[1].clone();
-        assert!(level.ready.load(Ordering::Acquire));
-        assert_eq!((level.width, level.height), (2, 2));
-        assert!(level.path.exists());
+        let levels = session.levels.lock().unwrap();
+        for level in &levels[1..=3] {
+            assert!(level.ready.load(Ordering::Acquire));
+            assert!(level.path.exists());
+        }
+        assert_eq!((levels[1].width, levels[1].height), (50, 50));
+        assert_eq!((levels[2].width, levels[2].height), (25, 25));
+        assert_eq!((levels[3].width, levels[3].height), (13, 13));
+        assert!(session.building_levels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_ensure_level_is_deduplicated() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let source = directory.path().join("source.bmp");
+        let rgba = vec![20u8, 40, 60, 255].repeat(100 * 100);
+        write_temp_bmp_raster(&rgba, 4, 100, 100, &source).unwrap();
+        let session = Arc::new(ImageSession {
+            session_id: 8,
+            path: source.clone(),
+            width: 100,
+            height: 100,
+            tile_size: 16,
+            preview_max_size: 100,
+            tileable: true,
+            raw_preview: false,
+            tile_source_path: source.clone(),
+            tile_source_is_temp: false,
+            max_level: 3,
+            levels: Mutex::new(make_level_sources(
+                8,
+                100,
+                100,
+                3,
+                source,
+                false,
+                Some(directory.path()),
+            )),
+            build_cancelled: Arc::new(AtomicBool::new(false)),
+            building_levels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_raster: Mutex::new(None),
+            preview_rgba: vec![],
+            nav_preview_webp: vec![],
+        });
+
+        let left = session.clone();
+        let right = session.clone();
+        let (left_result, right_result) = std::thread::scope(|scope| {
+            let left_task = scope.spawn(|| ensure_level(&left, 2));
+            let right_task = scope.spawn(|| ensure_level(&right, 2));
+            (left_task.join().unwrap(), right_task.join().unwrap())
+        });
+
+        left_result.unwrap();
+        right_result.unwrap();
+        assert!(session.levels.lock().unwrap()[2]
+            .ready
+            .load(Ordering::Acquire));
+        assert!(session.building_levels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ensure_level_waits_for_claimed_dependency_then_builds_tail() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let source = directory.path().join("source.bmp");
+        let rgba = vec![20u8, 40, 60, 255].repeat(100 * 100);
+        write_temp_bmp_raster(&rgba, 4, 100, 100, &source).unwrap();
+        let session = Arc::new(ImageSession {
+            session_id: 10,
+            path: source.clone(),
+            width: 100,
+            height: 100,
+            tile_size: 16,
+            preview_max_size: 100,
+            tileable: true,
+            raw_preview: false,
+            tile_source_path: source.clone(),
+            tile_source_is_temp: false,
+            max_level: 2,
+            levels: Mutex::new(make_level_sources(
+                10,
+                100,
+                100,
+                2,
+                source,
+                false,
+                Some(directory.path()),
+            )),
+            build_cancelled: Arc::new(AtomicBool::new(false)),
+            building_levels: Arc::new(Mutex::new(HashSet::new())),
+            pending_raster: Mutex::new(None),
+            preview_rgba: vec![],
+            nav_preview_webp: vec![],
+        });
+        let dependency_claim = claim_level_build(&session, 1).expect("应成功抢占依赖层");
+
+        let worker = session.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            sender.send(ensure_level(&worker, 2)).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(receiver.try_recv().is_err());
+        drop(dependency_claim);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        task.join().unwrap();
+
+        let levels = session.levels.lock().unwrap();
+        assert!(levels[1].ready.load(Ordering::Acquire));
+        assert!(levels[2].ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_level_build_claim_is_released_after_panic() {
+        let session = make_session(13);
+
+        let result = std::panic::catch_unwind(|| {
+            let _claim = claim_level_build(&session, 1).expect("应成功抢占测试层");
+            panic!("模拟构建线程 panic");
+        });
+
+        assert!(result.is_err());
+        assert!(session.building_levels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ensure_level_claim_wait_is_bounded() {
+        let session = make_session(14);
+        let claim = claim_level_build(&session, 1).expect("应成功抢占测试层");
+        let started = std::time::Instant::now();
+
+        let error = ensure_level(&session, 1).unwrap_err();
+
+        assert_eq!(error.code, "IO_ERROR");
+        assert!(error.message.contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        drop(claim);
+    }
+
+    #[test]
+    fn test_spawn_level_build_skips_cancelled_session() {
+        let session = make_session(11);
+        session.build_cancelled.store(true, Ordering::Release);
+
+        spawn_level_build(session.clone(), 1);
+
+        assert!(session.building_levels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ensure_level_above_max_reports_internal_range_error() {
+        let session = make_session(12);
+
+        let error = ensure_level(&session, session.max_level + 1).unwrap_err();
+
+        assert_eq!(error.code, "IO_ERROR");
+        assert!(error.message.contains("level index out of range"));
     }
 
     // ── session lifecycle ──
@@ -1171,6 +1426,7 @@ mod tests {
                 None,
             )),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            building_levels: Arc::new(Mutex::new(std::collections::HashSet::new())),
             preview_rgba: vec![],
             nav_preview_webp: vec![],
             pending_raster: Mutex::new(None),
@@ -1263,6 +1519,57 @@ mod tests {
         let (status, error) = handle_tile_request(state, 1, 1, 0, 0).unwrap_err();
         assert_eq!(status, 425);
         assert_eq!(error.code, "LEVEL_NOT_READY");
+    }
+
+    #[test]
+    fn test_level_not_ready_triggers_on_demand_build() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let source = directory.path().join("source.bmp");
+        let rgba = vec![20u8, 40, 60, 255].repeat(100 * 100);
+        write_temp_bmp_raster(&rgba, 4, 100, 100, &source).unwrap();
+        let session = Arc::new(ImageSession {
+            session_id: 9,
+            path: source.clone(),
+            width: 100,
+            height: 100,
+            tile_size: 16,
+            preview_max_size: 100,
+            tileable: true,
+            raw_preview: false,
+            tile_source_path: source.clone(),
+            tile_source_is_temp: false,
+            max_level: 3,
+            levels: Mutex::new(make_level_sources(
+                9,
+                100,
+                100,
+                3,
+                source,
+                false,
+                Some(directory.path()),
+            )),
+            build_cancelled: Arc::new(AtomicBool::new(false)),
+            building_levels: Arc::new(Mutex::new(HashSet::new())),
+            pending_raster: Mutex::new(None),
+            preview_rgba: vec![],
+            nav_preview_webp: vec![],
+        });
+        let state = Arc::new(Mutex::new(make_state()));
+        state.lock().unwrap().add_session(session.clone());
+
+        let (status, error) = handle_tile_request(state, 9, 3, 0, 0).unwrap_err();
+        assert_eq!(status, 425);
+        assert_eq!(error.code, "LEVEL_NOT_READY");
+        for _ in 0..100 {
+            if session.levels.lock().unwrap()[3]
+                .ready
+                .load(Ordering::Acquire)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("按需构建未在超时前发布 level3");
     }
 
     #[test]
