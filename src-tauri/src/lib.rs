@@ -12,7 +12,7 @@ use images::{open_directory, open_external_path, open_image_file, scan_directory
 use large_image::policy::probe_image;
 use large_image::session::{close_large_image, get_preview, open_large_image, LargeImageState};
 use settings::{get_settings, read_settings_file, save_settings};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager};
 use thumbnails::{clear_thumbnail_cache, enforce_disk_cache_limit, get_thumbnail, ThumbnailState};
 
@@ -23,40 +23,42 @@ struct PendingState {
     frontend_ready: bool,
 }
 
-#[derive(Default)]
-struct PendingOpenPaths(Mutex<PendingState>);
-
-impl PendingOpenPaths {
-    fn new(paths: Vec<String>) -> Self {
-        Self(Mutex::new(PendingState {
-            paths,
-            frontend_ready: false,
-        }))
-    }
-
+impl PendingState {
     /// 前端就绪：原子地置就绪并取走累积的待打开路径。
-    fn mark_ready_and_take(&self) -> Vec<String> {
-        let mut state = self.0.lock().unwrap();
-        state.frontend_ready = true;
-        std::mem::take(&mut state.paths)
+    fn mark_ready_and_take(&mut self) -> Vec<String> {
+        self.frontend_ready = true;
+        std::mem::take(&mut self.paths)
     }
 
     /// 运行期/启动期打开请求:前端未就绪则入队并返回 false(调用方不要 emit,
     /// 等前端就绪时由 mark_ready_and_take 取走);已就绪返回 true(走事件通道 emit)。
-    fn enqueue_or_ready(&self, paths: &[String]) -> bool {
-        let mut state = self.0.lock().unwrap();
-        if state.frontend_ready {
+    fn enqueue_or_ready(&mut self, paths: &[String]) -> bool {
+        if self.frontend_ready {
             true
         } else {
-            state.paths.extend_from_slice(paths);
+            self.paths.extend_from_slice(paths);
             false
         }
     }
 }
 
+/// 待打开路径用模块级 static 保存,而非 Tauri 托管状态:macOS 冷启动时
+/// openURLs Apple Event 可能早于 setup() 的 app.manage 到达,此时访问托管状态会
+/// panic,而 panic 无法穿过 objc 边界 → abort 崩溃。static 在任何生命周期阶段都可用。
+static PENDING_OPEN: OnceLock<Mutex<PendingState>> = OnceLock::new();
+
+fn pending_open() -> &'static Mutex<PendingState> {
+    PENDING_OPEN.get_or_init(|| Mutex::new(PendingState::default()))
+}
+
+/// 启动期把 argv 中的路径种入待打开队列。
+fn pending_seed(paths: Vec<String>) {
+    pending_open().lock().unwrap().paths.extend(paths);
+}
+
 #[tauri::command]
-fn take_pending_open_paths(state: tauri::State<'_, PendingOpenPaths>) -> Vec<String> {
-    state.mark_ready_and_take()
+fn take_pending_open_paths() -> Vec<String> {
+    pending_open().lock().unwrap().mark_ready_and_take()
 }
 
 /// 从 picsee:// URL 中提取路径部分（不含 query string）。
@@ -210,9 +212,7 @@ pub fn run() {
                 tile_concurrency,
                 memory_limit_mb,
             ))));
-            app.manage(PendingOpenPaths::new(images::extract_open_paths(
-                std::env::args(),
-            )));
+            pending_seed(images::extract_open_paths(std::env::args()));
 
             // 授权缩略图缓存目录
             if let Ok(cache_dir) = app.path().app_cache_dir() {
@@ -268,7 +268,7 @@ pub fn run() {
                 if !paths.is_empty() {
                     // 前端就绪 → 走事件通道；未就绪(冷启动 Apple Event 早于前端监听)→
                     // 入队,待前端 take_pending_open_paths 时取走,避免首次双击丢失。
-                    if app.state::<PendingOpenPaths>().enqueue_or_ready(&paths) {
+                    if pending_open().lock().unwrap().enqueue_or_ready(&paths) {
                         let _ = app.emit("open-paths", paths);
                     }
                     if let Some(window) = app.get_webview_window("main") {
@@ -282,7 +282,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_picsee_path, PendingOpenPaths};
+    use super::{extract_picsee_path, PendingState};
 
     #[test]
     fn test_extract_picsee_path_localhost() {
@@ -302,7 +302,10 @@ mod tests {
 
     #[test]
     fn pending_argv_paths_are_consumed_once() {
-        let pending = PendingOpenPaths::new(vec!["/tmp/image.png".to_string()]);
+        let mut pending = PendingState {
+            paths: vec!["/tmp/image.png".to_string()],
+            frontend_ready: false,
+        };
 
         assert_eq!(pending.mark_ready_and_take(), vec!["/tmp/image.png"]);
         assert!(pending.mark_ready_and_take().is_empty());
@@ -310,7 +313,7 @@ mod tests {
 
     #[test]
     fn opened_paths_queue_until_frontend_ready() {
-        let pending = PendingOpenPaths::new(Vec::new());
+        let mut pending = PendingState::default();
 
         // 前端未就绪：Apple Event 入队、不 emit。
         assert!(!pending.enqueue_or_ready(&["/tmp/a.png".to_string()]));
