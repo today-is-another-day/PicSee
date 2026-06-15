@@ -20,7 +20,12 @@ use crate::{color, extended_formats};
 
 use super::{
     bmp::{BmpReader, Rect},
+    policy::{probe_image_file, LoadMode},
     pyramid::generate_downscaled_raster,
+    pyramid_cache::{
+        evict_to_limit, load_manifest, pyramid_dir, pyramid_key, touch, write_manifest, LevelMeta,
+        PyramidManifest, PYRAMID_ALGO_VERSION,
+    },
     LargeImageError,
 };
 
@@ -84,6 +89,19 @@ pub struct ImageSession {
     pub levels: Mutex<Vec<Arc<LevelSource>>>,
     /// 会话关闭或逐出后通知后台停止发布新层。
     pub build_cancelled: Arc<AtomicBool>,
+    /// 内容寻址持久塔 hash；不可持久化的会话为 None。
+    pub pyramid_hash: Option<String>,
+    /// 持久塔目录。
+    pub pyramid_dir: Option<PathBuf>,
+    /// 全局按 hash 去重集合。
+    pub global_building: Arc<Mutex<HashSet<String>>>,
+    /// 活跃会话 hash 集合，供目录淘汰保护。
+    pub protected_hashes: Arc<Mutex<HashSet<String>>>,
+    /// 持久塔构建全局 IO 限流。
+    pub pyramid_semaphore: Arc<Semaphore>,
+    /// 持久塔缓存根目录及配额。
+    pub cache_root: Option<PathBuf>,
+    pub pyramid_disk_limit_bytes: u64,
     /// 正在构建的层级，避免后台全量构建与按需请求重复写同一层。
     pub building_levels: Arc<Mutex<HashSet<u32>>>,
     /// 待落盘的已解码图（非 BMP 大图）：open 时不写栅格、先返回预览，
@@ -110,6 +128,13 @@ pub struct LargeImageState {
     tile_cache_limit_bytes: usize,
     /// 并发控制信号量。
     pub semaphore: Arc<Semaphore>,
+    /// 持久塔全局单 IO 并发。
+    pub pyramid_semaphore: Arc<Semaphore>,
+    /// 当前进程正在构建的持久塔 hash。
+    pub global_building: Arc<Mutex<HashSet<String>>>,
+    pub protected_hashes: Arc<Mutex<HashSet<String>>>,
+    pub cache_root: Option<PathBuf>,
+    pub pyramid_disk_limit_bytes: u64,
 }
 
 impl LargeImageState {
@@ -117,7 +142,12 @@ impl LargeImageState {
     ///
     /// - `tile_concurrency`：最大并发解码数。
     /// - `memory_limit_mb`：内存上限（MB），瓦片缓存占其 40%。
-    pub fn new(tile_concurrency: usize, memory_limit_mb: usize) -> Self {
+    pub fn new(
+        tile_concurrency: usize,
+        memory_limit_mb: usize,
+        cache_root: Option<PathBuf>,
+        pyramid_disk_limit_mb: u64,
+    ) -> Self {
         let tile_cache_limit_bytes = memory_limit_mb * 1024 * 1024 * 40 / 100;
         Self {
             sessions: VecDeque::new(),
@@ -126,6 +156,11 @@ impl LargeImageState {
             tile_cache_bytes: 0,
             tile_cache_limit_bytes,
             semaphore: Arc::new(Semaphore::new(tile_concurrency)),
+            pyramid_semaphore: Arc::new(Semaphore::new(1)),
+            global_building: Arc::new(Mutex::new(HashSet::new())),
+            protected_hashes: Arc::new(Mutex::new(HashSet::new())),
+            cache_root,
+            pyramid_disk_limit_bytes: pyramid_disk_limit_mb.saturating_mul(1024 * 1024),
         }
     }
 
@@ -147,7 +182,14 @@ impl LargeImageState {
             }
         }
         self.sessions.push_back(session);
+        self.refresh_protected_hashes();
         evicted_temps
+    }
+
+    pub fn protected_hashes(&self) -> HashSet<String> {
+        let mut protected = self.protected_hashes.lock().unwrap().clone();
+        protected.extend(self.global_building.lock().unwrap().iter().cloned());
+        protected
     }
 
     /// 移除指定 session_id 的会话。返回其全部临时栅格路径。
@@ -160,7 +202,16 @@ impl LargeImageState {
             .unwrap_or_default();
         self.sessions.retain(|s| s.session_id != session_id);
         self.clear_session_tiles(session_id);
+        self.refresh_protected_hashes();
         temps
+    }
+
+    fn refresh_protected_hashes(&self) {
+        *self.protected_hashes.lock().unwrap() = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.pyramid_hash.clone())
+            .collect();
     }
 
     /// 生成并消费下一个会话 ID。
@@ -256,9 +307,23 @@ pub fn compute_max_level(mut width: u32, mut height: u32, tile_size: u32) -> u32
     level
 }
 
+fn file_fingerprint(
+    path: &Path,
+    tile_size: u32,
+) -> Result<super::pyramid_cache::PyramidKey, LargeImageError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| LargeImageError::io(format!("读取金字塔源文件元数据失败: {error}")))?;
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i128)
+        .unwrap_or(0);
+    Ok(pyramid_key(path, metadata.len(), mtime_ns, tile_size))
+}
+
 /// 初始化按层源：level0 立即 ready，其余层只发布尺寸和目标路径占位。
 fn make_level_sources(
-    session_id: u64,
     width: u32,
     height: u32,
     max_level: u32,
@@ -275,9 +340,9 @@ fn make_level_sources(
         } else {
             (
                 pyramid_dir
-                    .map(|dir| dir.join(format!("pyr-{session_id}-z{level}.bmp")))
+                    .map(|dir| dir.join(format!("z{level}.bmp")))
                     .unwrap_or_default(),
-                true,
+                pyramid_dir.is_none(),
                 false,
             )
         };
@@ -453,6 +518,102 @@ struct LevelBuildClaim {
     level: u32,
 }
 
+/// 持久塔全局构建 claim；离开作用域时释放 hash。
+struct PyramidBuildClaim {
+    global_building: Arc<Mutex<HashSet<String>>>,
+    hash: String,
+}
+
+impl Drop for PyramidBuildClaim {
+    fn drop(&mut self) {
+        self.global_building.lock().unwrap().remove(&self.hash);
+    }
+}
+
+fn claim_pyramid_build(session: &ImageSession) -> Option<PyramidBuildClaim> {
+    let hash = session.pyramid_hash.clone()?;
+    if !session.global_building.lock().unwrap().insert(hash.clone()) {
+        return None;
+    }
+    Some(PyramidBuildClaim {
+        global_building: session.global_building.clone(),
+        hash,
+    })
+}
+
+fn publish_manifest_levels(session: &ImageSession, manifest: &PyramidManifest) {
+    let Some(dir) = session.pyramid_dir.as_deref() else {
+        return;
+    };
+    let mut levels = session.levels.lock().unwrap();
+    for meta in &manifest.levels {
+        if let Some(level) = levels.get_mut(meta.z as usize) {
+            *level = Arc::new(LevelSource {
+                width: meta.width,
+                height: meta.height,
+                path: dir.join(format!("z{}.bmp", meta.z)),
+                is_temp: false,
+                ready: AtomicBool::new(true),
+            });
+        }
+    }
+}
+
+fn build_persistent_pyramid(session: &ImageSession) -> Result<(), LargeImageError> {
+    let Some(dir) = session.pyramid_dir.as_deref() else {
+        for level in 1..=session.max_level {
+            ensure_level(session, level)?;
+        }
+        return Ok(());
+    };
+    if let Some(manifest) = load_manifest(dir) {
+        publish_manifest_levels(session, &manifest);
+        touch(dir);
+        return Ok(());
+    }
+    let Some(_claim) = claim_pyramid_build(session) else {
+        return Ok(());
+    };
+    if let Some(manifest) = load_manifest(dir) {
+        publish_manifest_levels(session, &manifest);
+        return Ok(());
+    }
+    for level in 1..=session.max_level {
+        if session.build_cancelled.load(Ordering::Acquire) {
+            // M3: 已落盘的 z1..zk 是持久层(is_temp=false)，不会被
+            // cancel_and_collect_temp_levels 清理；manifest 尚未写成功，故清掉该 hash
+            // 目录的半成品，避免长期占配额。正常完成路径（manifest 已写）不会走到这里。
+            let _ = std::fs::remove_dir_all(dir);
+            return Ok(());
+        }
+        ensure_level(session, level)?;
+    }
+    let levels = session.levels.lock().unwrap();
+    let manifest = PyramidManifest {
+        algo_version: PYRAMID_ALGO_VERSION,
+        tile_size: session.tile_size,
+        levels: levels
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(z, level)| LevelMeta {
+                z: z as u32,
+                width: level.width,
+                height: level.height,
+            })
+            .collect(),
+    };
+    drop(levels);
+    write_manifest(dir, &manifest)?;
+    touch(dir);
+    if let Some(root) = session.cache_root.as_deref() {
+        let mut protected = session.protected_hashes.lock().unwrap().clone();
+        protected.extend(session.global_building.lock().unwrap().iter().cloned());
+        evict_to_limit(root, session.pyramid_disk_limit_bytes, &protected);
+    }
+    Ok(())
+}
+
 impl Drop for LevelBuildClaim {
     fn drop(&mut self) {
         self.building_levels.lock().unwrap().remove(&self.level);
@@ -565,14 +726,13 @@ fn ensure_level_inner(session: &ImageSession, level: u32) -> Result<(), LargeIma
     }
 
     if session.build_cancelled.load(Ordering::Acquire) {
-        let _ = std::fs::remove_file(&target.path);
         return Ok(());
     }
     let ready_level = Arc::new(LevelSource {
         width,
         height,
         path: target.path.clone(),
-        is_temp: true,
+        is_temp: target.is_temp,
         ready: AtomicBool::new(true),
     });
     session.levels.lock().unwrap()[level as usize] = ready_level;
@@ -584,12 +744,19 @@ fn spawn_level_build(session: Arc<ImageSession>, level: u32) {
     if session.build_cancelled.load(Ordering::Acquire) {
         return;
     }
-    let Some(_claim) = claim_level_build(&session, level) else {
-        return;
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        let _claim = _claim;
-        let _ = ensure_level_inner(&session, level);
+    tauri::async_runtime::spawn(async move {
+        let Ok(permit) = session.pyramid_semaphore.clone().acquire_owned().await else {
+            return;
+        };
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
+            if session.pyramid_hash.is_some() {
+                let _ = build_persistent_pyramid(&session);
+            } else {
+                let _ = ensure_level(&session, level);
+            }
+        })
+        .await;
     });
 }
 
@@ -859,7 +1026,7 @@ pub async fn open_large_image(
         .app_cache_dir()
         .ok()
         .map(|directory| directory.join("large-raster"));
-    let pyramid_dir = large_raster_dir.clone();
+    let cache_root = app.path().app_cache_dir().ok();
 
     let path_buf = std::path::PathBuf::from(&path);
     let ext = path_buf
@@ -992,15 +1159,40 @@ pub async fn open_large_image(
     let mut guard = state_arc.lock().unwrap();
     let session_id = guard.next_session_id();
     let max_level = compute_max_level(width, height, tile_size);
+    // M4: fingerprint 失败不应让整个 open 失败（白屏）。失败 → 降级为非持久塔
+    // （key=None），仍走临时栅格/level0 正常出 preview。
+    let key = match tileable.then(|| file_fingerprint(&path_buf, tile_size)) {
+        Some(Ok(key)) => Some(key),
+        Some(Err(error)) => {
+            eprintln!(
+                "[PicSee] 计算金字塔指纹失败，降级为非持久塔: {}",
+                error.message
+            );
+            None
+        }
+        None => None,
+    };
+    let persistent_dir = key
+        .as_ref()
+        .and_then(|key| cache_root.as_deref().map(|root| pyramid_dir(root, key)));
+    let manifest = persistent_dir.as_deref().and_then(load_manifest);
+    if let Some(dir) = persistent_dir.as_deref() {
+        if manifest.is_some() {
+            touch(dir);
+        }
+    }
     let levels = make_level_sources(
-        session_id,
         width,
         height,
         max_level,
         tile_source_path.clone(),
         tile_source_is_temp,
-        pyramid_dir.as_deref(),
+        persistent_dir.as_deref(),
     );
+    let global_building = guard.global_building.clone();
+    let protected_hashes = guard.protected_hashes.clone();
+    let pyramid_semaphore = guard.pyramid_semaphore.clone();
+    let pyramid_disk_limit_bytes = guard.pyramid_disk_limit_bytes;
     let session = Arc::new(ImageSession {
         session_id,
         path: path_buf,
@@ -1015,11 +1207,21 @@ pub async fn open_large_image(
         max_level,
         levels: Mutex::new(levels),
         build_cancelled: Arc::new(AtomicBool::new(false)),
+        pyramid_hash: key.map(|key| key.hash),
+        pyramid_dir: persistent_dir,
+        global_building,
+        protected_hashes,
+        pyramid_semaphore,
+        cache_root,
+        pyramid_disk_limit_bytes,
         building_levels: Arc::new(Mutex::new(HashSet::new())),
         preview_rgba,
         nav_preview_webp,
         pending_raster: Mutex::new(pending_img),
     });
+    if let Some(manifest) = manifest.as_ref() {
+        publish_manifest_levels(&session, manifest);
+    }
     let result = OpenLargeImageResult {
         session_id: session.session_id,
         width,
@@ -1033,7 +1235,10 @@ pub async fn open_large_image(
         preview_h,
     };
     // 非 BMP 大图：后台尽快写栅格（即使用户不放大也释放整图内存；首个瓦片请求亦会触发 ensure_raster）。
-    let bg_pyramid_session = if tileable
+    // S4: 命中持久 manifest（各层已 ready）时不再 spawn 后台建塔——build_persistent_pyramid
+    // 只会 load_manifest 早退、白做一次 IO+publish。仅未命中 manifest（需构建）时才 spawn。
+    let bg_pyramid_session = if manifest.is_none()
+        && tileable
         && max_level >= 1
         && !session.levels.lock().unwrap()[1]
             .path
@@ -1055,13 +1260,15 @@ pub async fn open_large_image(
         let _ = std::fs::remove_file(temp);
     }
     if let Some(session) = bg_pyramid_session {
-        tauri::async_runtime::spawn_blocking(move || {
-            for level in 1..=session.max_level {
-                if session.build_cancelled.load(Ordering::Acquire) {
-                    break;
-                }
-                let _ = ensure_level(&session, level);
-            }
+        tauri::async_runtime::spawn(async move {
+            let Ok(permit) = session.pyramid_semaphore.clone().acquire_owned().await else {
+                return;
+            };
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let _permit = permit;
+                let _ = build_persistent_pyramid(&session);
+            })
+            .await;
         });
     } else if let Some(session) = bg_raster_session {
         tauri::async_runtime::spawn_blocking(move || {
@@ -1070,6 +1277,131 @@ pub async fn open_large_image(
     }
 
     Ok(result)
+}
+
+/// 可测的单路径预建逻辑：仅为可分块的大图 BMP 建持久塔。
+fn prefetch_path(
+    path: &Path,
+    settings: &crate::settings::LargeImageSettings,
+    cache_root: &Path,
+    global_building: Arc<Mutex<HashSet<String>>>,
+    protected_hashes: Arc<Mutex<HashSet<String>>>,
+    pyramid_semaphore: Arc<Semaphore>,
+    disk_limit_bytes: u64,
+) -> Result<bool, LargeImageError> {
+    let Ok(probe) = probe_image_file(path, settings) else {
+        return Ok(false);
+    };
+    if !probe.tileable || !probe.is_large || probe.load_mode == LoadMode::Normal {
+        return Ok(false);
+    }
+    let tile_size = settings.tile_size as u32;
+    let key = file_fingerprint(path, tile_size)?;
+    let dir = pyramid_dir(cache_root, &key);
+    if load_manifest(&dir).is_some() {
+        touch(&dir);
+        return Ok(false);
+    }
+    let max_level = compute_max_level(probe.width, probe.height, tile_size);
+    if max_level == 0 {
+        return Ok(false);
+    }
+    let session = ImageSession {
+        session_id: 0,
+        path: path.to_path_buf(),
+        width: probe.width,
+        height: probe.height,
+        tile_size,
+        preview_max_size: settings.preview_max_size as u32,
+        tileable: true,
+        raw_preview: false,
+        tile_source_path: path.to_path_buf(),
+        tile_source_is_temp: false,
+        max_level,
+        levels: Mutex::new(make_level_sources(
+            probe.width,
+            probe.height,
+            max_level,
+            path.to_path_buf(),
+            false,
+            Some(&dir),
+        )),
+        build_cancelled: Arc::new(AtomicBool::new(false)),
+        pyramid_hash: Some(key.hash),
+        pyramid_dir: Some(dir),
+        global_building,
+        protected_hashes,
+        // N1: 复用命令层共享的限流 semaphore（与 open 路径一致），避免误导——
+        // ImageSession 内部从不 acquire 该字段，限流实际发生在调用点。
+        pyramid_semaphore,
+        cache_root: Some(cache_root.to_path_buf()),
+        pyramid_disk_limit_bytes: disk_limit_bytes,
+        building_levels: Arc::new(Mutex::new(HashSet::new())),
+        pending_raster: Mutex::new(None),
+        preview_rgba: Vec::new(),
+        nav_preview_webp: Vec::new(),
+    };
+    build_persistent_pyramid(&session)?;
+    Ok(true)
+}
+
+/// 后台为邻居大图预建持久金字塔；命令本身不等待磁盘任务完成。
+#[tauri::command]
+pub async fn prefetch_large_pyramid(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<(), LargeImageError> {
+    let settings_path = app
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join("settings.json"));
+    let settings = settings_path
+        .as_deref()
+        .and_then(|path| read_settings_file(path).ok())
+        .unwrap_or_default()
+        .large_image;
+    let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
+    let (cache_root, global_building, protected_hashes, semaphore, disk_limit_bytes) = {
+        let state = state_arc.lock().unwrap();
+        (
+            state.cache_root.clone(),
+            state.global_building.clone(),
+            state.protected_hashes.clone(),
+            state.pyramid_semaphore.clone(),
+            state.pyramid_disk_limit_bytes,
+        )
+    };
+    let Some(cache_root) = cache_root else {
+        return Ok(());
+    };
+    for path in paths {
+        let settings = settings.clone();
+        let cache_root = cache_root.clone();
+        let global_building = global_building.clone();
+        let protected_hashes = protected_hashes.clone();
+        let semaphore = semaphore.clone();
+        tauri::async_runtime::spawn(async move {
+            let pyramid_semaphore = semaphore.clone();
+            let Ok(permit) = semaphore.acquire_owned().await else {
+                return;
+            };
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let _permit = permit;
+                let _ = prefetch_path(
+                    Path::new(&path),
+                    &settings,
+                    &cache_root,
+                    global_building,
+                    protected_hashes,
+                    pyramid_semaphore,
+                    disk_limit_bytes,
+                );
+            })
+            .await;
+        });
+    }
+    Ok(())
 }
 
 /// 关闭大图会话。
@@ -1201,15 +1533,7 @@ mod tests {
         let source = directory.path().join("source.bmp");
         let rgba = vec![20u8, 40, 60, 255].repeat(100 * 100);
         write_temp_bmp_raster(&rgba, 4, 100, 100, &source).unwrap();
-        let levels = make_level_sources(
-            7,
-            100,
-            100,
-            3,
-            source.clone(),
-            false,
-            Some(directory.path()),
-        );
+        let levels = make_level_sources(100, 100, 3, source.clone(), false, Some(directory.path()));
         let session = ImageSession {
             session_id: 7,
             path: source.clone(),
@@ -1224,6 +1548,13 @@ mod tests {
             max_level: 3,
             levels: Mutex::new(levels),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            pyramid_hash: None,
+            pyramid_dir: None,
+            global_building: Arc::new(Mutex::new(HashSet::new())),
+            protected_hashes: Arc::new(Mutex::new(HashSet::new())),
+            pyramid_semaphore: Arc::new(Semaphore::new(1)),
+            cache_root: None,
+            pyramid_disk_limit_bytes: 0,
             building_levels: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_raster: Mutex::new(None),
             preview_rgba: vec![],
@@ -1262,7 +1593,6 @@ mod tests {
             tile_source_is_temp: false,
             max_level: 3,
             levels: Mutex::new(make_level_sources(
-                8,
                 100,
                 100,
                 3,
@@ -1271,6 +1601,13 @@ mod tests {
                 Some(directory.path()),
             )),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            pyramid_hash: None,
+            pyramid_dir: None,
+            global_building: Arc::new(Mutex::new(HashSet::new())),
+            protected_hashes: Arc::new(Mutex::new(HashSet::new())),
+            pyramid_semaphore: Arc::new(Semaphore::new(1)),
+            cache_root: None,
+            pyramid_disk_limit_bytes: 0,
             building_levels: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_raster: Mutex::new(None),
             preview_rgba: vec![],
@@ -1312,7 +1649,6 @@ mod tests {
             tile_source_is_temp: false,
             max_level: 2,
             levels: Mutex::new(make_level_sources(
-                10,
                 100,
                 100,
                 2,
@@ -1321,6 +1657,13 @@ mod tests {
                 Some(directory.path()),
             )),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            pyramid_hash: None,
+            pyramid_dir: None,
+            global_building: Arc::new(Mutex::new(HashSet::new())),
+            protected_hashes: Arc::new(Mutex::new(HashSet::new())),
+            pyramid_semaphore: Arc::new(Semaphore::new(1)),
+            cache_root: None,
+            pyramid_disk_limit_bytes: 0,
             building_levels: Arc::new(Mutex::new(HashSet::new())),
             pending_raster: Mutex::new(None),
             preview_rgba: vec![],
@@ -1362,6 +1705,22 @@ mod tests {
     }
 
     #[test]
+    fn test_pyramid_build_claim_deduplicates_across_sessions_and_releases() {
+        let global = Arc::new(Mutex::new(HashSet::new()));
+        let mut first = make_session(21);
+        let mut second = make_session(22);
+        Arc::get_mut(&mut first).unwrap().pyramid_hash = Some("same".to_string());
+        Arc::get_mut(&mut first).unwrap().global_building = global.clone();
+        Arc::get_mut(&mut second).unwrap().pyramid_hash = Some("same".to_string());
+        Arc::get_mut(&mut second).unwrap().global_building = global.clone();
+
+        let claim = claim_pyramid_build(&first).expect("首个 session 应获得全局 claim");
+        assert!(claim_pyramid_build(&second).is_none());
+        drop(claim);
+        assert!(claim_pyramid_build(&second).is_some());
+    }
+
+    #[test]
     fn test_ensure_level_claim_wait_is_bounded() {
         let session = make_session(14);
         let claim = claim_level_build(&session, 1).expect("应成功抢占测试层");
@@ -1398,7 +1757,7 @@ mod tests {
     // ── session lifecycle ──
 
     fn make_state() -> LargeImageState {
-        LargeImageState::new(4, 512)
+        LargeImageState::new(4, 512, None, 0)
     }
 
     fn make_session(id: u64) -> Arc<ImageSession> {
@@ -1417,7 +1776,6 @@ mod tests {
             tile_source_is_temp: false,
             max_level,
             levels: Mutex::new(make_level_sources(
-                id,
                 1000,
                 1000,
                 max_level,
@@ -1426,6 +1784,13 @@ mod tests {
                 None,
             )),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            pyramid_hash: None,
+            pyramid_dir: None,
+            global_building: Arc::new(Mutex::new(HashSet::new())),
+            protected_hashes: Arc::new(Mutex::new(HashSet::new())),
+            pyramid_semaphore: Arc::new(Semaphore::new(1)),
+            cache_root: None,
+            pyramid_disk_limit_bytes: 0,
             building_levels: Arc::new(Mutex::new(std::collections::HashSet::new())),
             preview_rgba: vec![],
             nav_preview_webp: vec![],
@@ -1474,6 +1839,115 @@ mod tests {
         assert!(state.get_tile_cached((1, 0, 0, 0)).is_none());
         assert_eq!(state.get_tile_cached((2, 0, 0, 0)), Some(vec![4, 5]));
         assert_eq!(state.tile_cache_bytes, 2);
+    }
+
+    #[test]
+    fn test_persistent_levels_survive_session_removal() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let persistent = directory.path().join("z1.bmp");
+        std::fs::write(&persistent, b"persistent").unwrap();
+        let mut session = make_session(30);
+        let session_mut = Arc::get_mut(&mut session).unwrap();
+        session_mut.pyramid_hash = Some("persistent".to_string());
+        session_mut.levels.lock().unwrap()[1] = Arc::new(LevelSource {
+            width: 500,
+            height: 500,
+            path: persistent.clone(),
+            is_temp: false,
+            ready: AtomicBool::new(true),
+        });
+        let mut state = make_state();
+        state.add_session(session);
+
+        for temp in state.remove_session(30) {
+            let _ = std::fs::remove_file(temp);
+        }
+
+        assert!(persistent.exists());
+    }
+
+    #[test]
+    fn test_prefetch_path_builds_manifest_and_reuses_it() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let source = directory.path().join("source.bmp");
+        let rgba = vec![20u8, 40, 60, 255].repeat(600 * 600);
+        write_temp_bmp_raster(&rgba, 4, 600, 600, &source).unwrap();
+        let mut settings = crate::settings::LargeImageSettings::default();
+        settings.pixel_threshold = 1;
+        let global = Arc::new(Mutex::new(HashSet::new()));
+        let protected = Arc::new(Mutex::new(HashSet::new()));
+
+        assert!(prefetch_path(
+            &source,
+            &settings,
+            directory.path(),
+            global.clone(),
+            protected.clone(),
+            Arc::new(Semaphore::new(1)),
+            u64::MAX,
+        )
+        .unwrap());
+        let dir = pyramid_dir(
+            directory.path(),
+            &file_fingerprint(&source, settings.tile_size as u32).unwrap(),
+        );
+        assert!(load_manifest(&dir).is_some());
+        let modified = std::fs::metadata(dir.join("z1.bmp"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert!(!prefetch_path(
+            &source,
+            &settings,
+            directory.path(),
+            global,
+            protected,
+            Arc::new(Semaphore::new(1)),
+            u64::MAX,
+        )
+        .unwrap());
+        assert_eq!(
+            std::fs::metadata(dir.join("z1.bmp"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn test_prefetch_path_safely_skips_invalid_and_small_files() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let invalid = directory.path().join("invalid.txt");
+        std::fs::write(&invalid, b"not image").unwrap();
+        let small = directory.path().join("small.bmp");
+        let rgba = vec![20u8, 40, 60, 255].repeat(8 * 8);
+        write_temp_bmp_raster(&rgba, 4, 8, 8, &small).unwrap();
+        let global = Arc::new(Mutex::new(HashSet::new()));
+        let protected = Arc::new(Mutex::new(HashSet::new()));
+        let settings = crate::settings::LargeImageSettings::default();
+
+        assert!(!prefetch_path(
+            &invalid,
+            &settings,
+            directory.path(),
+            global.clone(),
+            protected.clone(),
+            Arc::new(Semaphore::new(1)),
+            u64::MAX,
+        )
+        .unwrap());
+        assert!(!prefetch_path(
+            &small,
+            &settings,
+            directory.path(),
+            global,
+            protected,
+            Arc::new(Semaphore::new(1)),
+            u64::MAX,
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1540,7 +2014,6 @@ mod tests {
             tile_source_is_temp: false,
             max_level: 3,
             levels: Mutex::new(make_level_sources(
-                9,
                 100,
                 100,
                 3,
@@ -1549,6 +2022,13 @@ mod tests {
                 Some(directory.path()),
             )),
             build_cancelled: Arc::new(AtomicBool::new(false)),
+            pyramid_hash: None,
+            pyramid_dir: None,
+            global_building: Arc::new(Mutex::new(HashSet::new())),
+            protected_hashes: Arc::new(Mutex::new(HashSet::new())),
+            pyramid_semaphore: Arc::new(Semaphore::new(1)),
+            cache_root: None,
+            pyramid_disk_limit_bytes: 0,
             building_levels: Arc::new(Mutex::new(HashSet::new())),
             pending_raster: Mutex::new(None),
             preview_rgba: vec![],
@@ -1610,7 +2090,7 @@ mod tests {
     #[test]
     fn test_tile_cache_eviction_on_limit() {
         // 内存限制 1MB，40% = 409600 字节
-        let mut state = LargeImageState::new(4, 1);
+        let mut state = LargeImageState::new(4, 1, None, 0);
         // 每个瓦片 200KB，放 3 个，应触发逐出
         let tile_data = vec![0u8; 200 * 1024];
         state.put_tile_cached((1, 0, 0, 0), tile_data.clone());

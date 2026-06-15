@@ -165,6 +165,11 @@ pub struct LargeImageSettings {
     pub enable_tile_prefetch: bool,
     /// 瓦片预取半径。
     pub prefetch_radius: u32,
+    /// 持久金字塔磁盘缓存上限，单位 MB。
+    #[serde(rename = "pyramidDiskCacheMB")]
+    pub pyramid_disk_cache_mb: u64,
+    /// 切图时前后预建邻居数量。
+    pub neighbor_prefetch_count: u32,
 }
 
 /// 缓存设置。
@@ -259,6 +264,8 @@ impl Default for LargeImageSettings {
             tile_size: TileSize::Size512,
             enable_tile_prefetch: true,
             prefetch_radius: 1,
+            pyramid_disk_cache_mb: 1024,
+            neighbor_prefetch_count: 1,
         }
     }
 }

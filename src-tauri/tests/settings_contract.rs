@@ -27,6 +27,8 @@ fn default_settings_match_expected_baseline() {
     assert_eq!(settings.large_image.file_size_threshold_mb, 300);
     assert_eq!(settings.large_image.pixel_threshold, 50_000_000);
     assert_eq!(settings.large_image.side_threshold, 12_000);
+    assert_eq!(settings.large_image.pyramid_disk_cache_mb, 1024);
+    assert_eq!(settings.large_image.neighbor_prefetch_count, 1);
     assert_eq!(
         settings.layout.thumbnail_position,
         ThumbnailPosition::Bottom
@@ -41,6 +43,8 @@ fn settings_serialize_with_camel_case_fields_and_enum_values() {
     assert_eq!(value["viewer"]["viewerBackground"], "dark");
     assert_eq!(value["viewer"]["viewerBackgroundColor"], "#202020");
     assert!(value["largeImage"]["fileSizeThresholdMB"].is_number());
+    assert!(value["largeImage"]["pyramidDiskCacheMB"].is_number());
+    assert!(value["largeImage"]["neighborPrefetchCount"].is_number());
     assert!(value["cache"]["memoryCacheLimitMB"].is_number());
     assert!(value["cache"]["diskCacheLimitMB"].is_number());
     assert!(value["cache"]["clearTempTileOnExit"].is_boolean());

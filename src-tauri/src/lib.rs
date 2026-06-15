@@ -10,7 +10,9 @@ use extended_formats::prefetch_system_decode;
 use file_operations::{copy_file_to_clipboard, move_to_trash, reveal_in_finder};
 use images::{open_directory, open_external_path, open_image_file, scan_directory};
 use large_image::policy::probe_image;
-use large_image::session::{close_large_image, get_preview, open_large_image, LargeImageState};
+use large_image::session::{
+    close_large_image, get_preview, open_large_image, prefetch_large_pyramid, LargeImageState,
+};
 use settings::{get_settings, read_settings_file, save_settings};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager};
@@ -208,9 +210,12 @@ pub fn run() {
             // M4: 大图 managed state
             let tile_concurrency = settings.performance.tile_concurrency.clamp(1, 16) as usize;
             let memory_limit_mb = settings.cache.memory_cache_limit_mb as usize;
+            let cache_root = app.path().app_cache_dir().ok();
             app.manage(Arc::new(Mutex::new(LargeImageState::new(
                 tile_concurrency,
                 memory_limit_mb,
+                cache_root,
+                settings.large_image.pyramid_disk_cache_mb,
             ))));
             pending_seed(images::extract_open_paths(std::env::args()));
 
@@ -232,6 +237,9 @@ pub fn run() {
                 tauri::async_runtime::spawn_blocking(move || {
                     enforce_disk_cache_limit(&thumb_dir, disk_cache_limit_bytes)
                 });
+                // S5: 不在启动期淘汰持久金字塔——彼时 protected 为空，可能与冷启动开图
+                // 命中持久塔读 z{L}.bmp 竞态，把目录 remove_dir_all。持久塔淘汰已在每次
+                // 建塔完成后（build_persistent_pyramid 末尾）用正确 protected 触发，足够。
             }
 
             Ok(())
@@ -253,6 +261,7 @@ pub fn run() {
             open_large_image,
             close_large_image,
             get_preview,
+            prefetch_large_pyramid,
             take_pending_open_paths,
         ])
         .build(tauri::generate_context!())
