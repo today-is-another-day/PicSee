@@ -269,7 +269,10 @@ impl BmpReader {
         let src_h = src_y2.saturating_sub(src_y);
 
         if src_w == 0 || src_h == 0 || target_width == 0 || target_height == 0 {
-            return Ok(vec![0u8; target_width as usize * target_height as usize * 4]);
+            return Ok(vec![
+                0u8;
+                target_width as usize * target_height as usize * 4
+            ]);
         }
 
         let threads = threads.clamp(1, target_height);

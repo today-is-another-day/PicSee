@@ -1,8 +1,11 @@
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
-    path::Path,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use lru::LruCache;
@@ -17,6 +20,7 @@ use crate::{color, extended_formats};
 
 use super::{
     bmp::{BmpReader, Rect},
+    pyramid::generate_downscaled_raster,
     LargeImageError,
 };
 
@@ -41,6 +45,21 @@ static RASTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 /// 单个大图会话。
 #[derive(Debug)]
+pub struct LevelSource {
+    /// 该层像素宽。
+    pub width: u32,
+    /// 该层像素高。
+    pub height: u32,
+    /// 该层瓦片读取源。
+    pub path: PathBuf,
+    /// 是否为本引擎生成、随会话清理的临时栅格。
+    pub is_temp: bool,
+    /// 该层是否已经完整写入并可读取。
+    pub ready: AtomicBool,
+}
+
+/// 单个大图会话。
+#[derive(Debug)]
 pub struct ImageSession {
     pub session_id: u64,
     pub path: std::path::PathBuf,
@@ -55,6 +74,12 @@ pub struct ImageSession {
     pub tile_source_path: std::path::PathBuf,
     /// tile_source_path 是否为本引擎生成的临时栅格（会话关闭时删除）。
     pub tile_source_is_temp: bool,
+    /// 最小的整层可放入单个 tile 的层级。
+    pub max_level: u32,
+    /// 按 z 索引的层源；level0 初始可用，其余层待后台构建。
+    pub levels: Mutex<Vec<Arc<LevelSource>>>,
+    /// 会话关闭或逐出后通知后台停止发布新层。
+    pub build_cancelled: Arc<AtomicBool>,
     /// 待落盘的已解码图（非 BMP 大图）：open 时不写栅格、先返回预览，
     /// 首个瓦片请求或后台任务调用 ensure_raster 时写盘并释放此图。None 表示无需/已完成。
     pub pending_raster: Mutex<Option<image::DynamicImage>>,
@@ -106,32 +131,30 @@ impl LargeImageState {
             .cloned()
     }
 
-    /// 添加会话；超过 2 个时逐出最旧的。返回被逐出会话的临时栅格路径（供调用方删除）。
+    /// 添加会话；超过 2 个时逐出最旧的。返回被逐出会话的临时栅格路径。
     pub fn add_session(&mut self, session: Arc<ImageSession>) -> Vec<std::path::PathBuf> {
         let mut evicted_temps = Vec::new();
         while self.sessions.len() >= 2 {
             if let Some(evicted) = self.sessions.pop_front() {
                 self.clear_session_tiles(evicted.session_id);
-                if evicted.tile_source_is_temp {
-                    evicted_temps.push(evicted.tile_source_path.clone());
-                }
+                evicted_temps.extend(cancel_and_collect_temp_levels(&evicted));
             }
         }
         self.sessions.push_back(session);
         evicted_temps
     }
 
-    /// 移除指定 session_id 的会话。返回其临时栅格路径（若有，供调用方删除）。
-    pub fn remove_session(&mut self, session_id: u64) -> Option<std::path::PathBuf> {
-        let temp = self
+    /// 移除指定 session_id 的会话。返回其全部临时栅格路径。
+    pub fn remove_session(&mut self, session_id: u64) -> Vec<std::path::PathBuf> {
+        let temps = self
             .sessions
             .iter()
             .find(|s| s.session_id == session_id)
-            .filter(|s| s.tile_source_is_temp)
-            .map(|s| s.tile_source_path.clone());
+            .map(|session| cancel_and_collect_temp_levels(session))
+            .unwrap_or_default();
         self.sessions.retain(|s| s.session_id != session_id);
         self.clear_session_tiles(session_id);
-        temp
+        temps
     }
 
     /// 生成并消费下一个会话 ID。
@@ -193,6 +216,7 @@ pub struct OpenLargeImageResult {
     pub preview_max_size: u32,
     pub tileable: bool,
     pub raw_preview: bool,
+    pub max_level: u32,
     /// 预览图像素宽（前端按此尺寸构造 ImageData）。
     pub preview_w: u32,
     /// 预览图像素高。
@@ -213,6 +237,68 @@ pub fn scale_to_fit_correct(w: u32, h: u32, max: u32) -> (u32, u32) {
         let new_w = (w as u64 * max as u64 / h as u64).max(1) as u32;
         (new_w, new_h)
     }
+}
+
+/// 计算最小层级，使该层宽高都不超过单个 tile。
+pub fn compute_max_level(mut width: u32, mut height: u32, tile_size: u32) -> u32 {
+    let mut level = 0;
+    while width > tile_size || height > tile_size {
+        width = width.div_ceil(2);
+        height = height.div_ceil(2);
+        level += 1;
+    }
+    level
+}
+
+/// 初始化按层源：level0 立即 ready，其余层只发布尺寸和目标路径占位。
+fn make_level_sources(
+    session_id: u64,
+    width: u32,
+    height: u32,
+    max_level: u32,
+    level0_path: PathBuf,
+    level0_is_temp: bool,
+    pyramid_dir: Option<&Path>,
+) -> Vec<Arc<LevelSource>> {
+    let mut levels = Vec::with_capacity(max_level as usize + 1);
+    let mut level_width = width;
+    let mut level_height = height;
+    for level in 0..=max_level {
+        let (path, is_temp, ready) = if level == 0 {
+            (level0_path.clone(), level0_is_temp, true)
+        } else {
+            (
+                pyramid_dir
+                    .map(|dir| dir.join(format!("pyr-{session_id}-z{level}.bmp")))
+                    .unwrap_or_default(),
+                true,
+                false,
+            )
+        };
+        levels.push(Arc::new(LevelSource {
+            width: level_width,
+            height: level_height,
+            path,
+            is_temp,
+            ready: AtomicBool::new(ready),
+        }));
+        level_width = level_width.div_ceil(2);
+        level_height = level_height.div_ceil(2);
+    }
+    levels
+}
+
+/// 取消后台构建并收集会话创建的临时层文件。
+fn cancel_and_collect_temp_levels(session: &ImageSession) -> Vec<PathBuf> {
+    session.build_cancelled.store(true, Ordering::Release);
+    session
+        .levels
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|level| level.is_temp && !level.path.as_os_str().is_empty())
+        .map(|level| level.path.clone())
+        .collect()
 }
 
 /// 将 RGBA 字节编码为 WebP。
@@ -355,6 +441,76 @@ fn ensure_raster(session: &ImageSession) -> Result<(), LargeImageError> {
     }
 }
 
+/// 确保指定层已完整生成；Phase 1A 只调度 level1，但保留依赖链生成能力。
+fn ensure_level(session: &ImageSession, level: u32) -> Result<(), LargeImageError> {
+    if session.build_cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if level == 0 {
+        ensure_raster(session)?;
+        return Ok(());
+    }
+
+    let target = {
+        let levels = session.levels.lock().unwrap();
+        let target = levels
+            .get(level as usize)
+            .cloned()
+            .ok_or_else(|| LargeImageError::tile_out_of_range(0, 0))?;
+        if target.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        target
+    };
+    ensure_level(session, level - 1)?;
+    if session.build_cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    let source = {
+        let levels = session.levels.lock().unwrap();
+        levels[level as usize - 1].clone()
+    };
+    if !source.ready.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if target.path.as_os_str().is_empty() {
+        return Err(LargeImageError::io("没有可用的金字塔缓存目录"));
+    }
+
+    let part_path = target.path.with_extension("bmp.part");
+    let generated = generate_downscaled_raster(&source.path, &part_path);
+    let (width, height) = match generated {
+        Ok(size) => size,
+        Err(error) => {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error);
+        }
+    };
+    if session.build_cancelled.load(Ordering::Acquire) {
+        let _ = std::fs::remove_file(&part_path);
+        return Ok(());
+    }
+    if let Err(error) = std::fs::rename(&part_path, &target.path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(LargeImageError::io(format!("发布金字塔栅格失败: {error}")));
+    }
+
+    if session.build_cancelled.load(Ordering::Acquire) {
+        let _ = std::fs::remove_file(&target.path);
+        return Ok(());
+    }
+    let ready_level = Arc::new(LevelSource {
+        width,
+        height,
+        path: target.path.clone(),
+        is_temp: true,
+        ready: AtomicBool::new(true),
+    });
+    session.levels.lock().unwrap()[level as usize] = ready_level;
+    Ok(())
+}
+
 /// 最近邻把 RGBA 缩到最长边 ≤ cap，返回 (rgba, w, h)。
 fn downscale_rgba(src: &[u8], sw: u32, sh: u32, cap: u32) -> (Vec<u8>, u32, u32) {
     let (nw, nh) = scale_to_fit_correct(sw, sh, cap);
@@ -437,8 +593,8 @@ fn write_temp_bmp_raster(
     let dst_row = (w as usize * channels + 3) & !3;
     let file_size = 54u64 + dst_row as u64 * h as u64;
 
-    let file =
-        std::fs::File::create(dst).map_err(|e| LargeImageError::io(format!("创建栅格失败: {e}")))?;
+    let file = std::fs::File::create(dst)
+        .map_err(|e| LargeImageError::io(format!("创建栅格失败: {e}")))?;
     let mut writer = BufWriter::new(file);
 
     // BITMAPINFOHEADER（54 字节）：top-down（高度取负）、BI_RGB。
@@ -500,11 +656,11 @@ pub fn handle_preview_request(
 pub fn handle_tile_request(
     state_arc: Arc<Mutex<LargeImageState>>,
     session_id: u64,
-    _z: u32,
+    z: u32,
     tile_x: u32,
     tile_y: u32,
 ) -> Result<Vec<u8>, (u16, LargeImageError)> {
-    let tile_key: TileKey = (session_id, 0, tile_x, tile_y);
+    let tile_key: TileKey = (session_id, z, tile_x, tile_y);
 
     // 先查缓存
     {
@@ -523,18 +679,36 @@ pub fn handle_tile_request(
     if !session.tileable {
         return Err((415, LargeImageError::tiles_unavailable()));
     }
-    // 非 BMP 大图：首个瓦片触发懒生成栅格（后台任务可能已写好；per-session 锁保证只写一次）。
-    ensure_raster(&session).map_err(|e| (500u16, e))?;
+    if z > session.max_level {
+        return Err((400, LargeImageError::tile_out_of_range(tile_x, tile_y)));
+    }
+    let level = session
+        .levels
+        .lock()
+        .unwrap()
+        .get(z as usize)
+        .cloned()
+        .ok_or_else(|| (400, LargeImageError::tile_out_of_range(tile_x, tile_y)))?;
+    if !level.ready.load(Ordering::Acquire) {
+        return Err((
+            425,
+            LargeImageError::new("LEVEL_NOT_READY", format!("Level {z} is not ready")),
+        ));
+    }
+    // 非 BMP level0：首个瓦片触发懒生成栅格；level1 构建也会先执行同一逻辑。
+    if z == 0 {
+        ensure_raster(&session).map_err(|e| (500u16, e))?;
+    }
     let (path, tile_size, img_w, img_h) = (
-        session.tile_source_path.clone(),
+        level.path.clone(),
         session.tile_size,
-        session.width,
-        session.height,
+        level.width,
+        level.height,
     );
 
     // 验证瓦片范围
-    let tiles_x = (img_w + tile_size - 1) / tile_size;
-    let tiles_y = (img_h + tile_size - 1) / tile_size;
+    let tiles_x = img_w.div_ceil(tile_size);
+    let tiles_y = img_h.div_ceil(tile_size);
     if tile_x >= tiles_x || tile_y >= tiles_y {
         return Err((400, LargeImageError::tile_out_of_range(tile_x, tile_y)));
     }
@@ -602,6 +776,7 @@ pub async fn open_large_image(
         .app_cache_dir()
         .ok()
         .map(|directory| directory.join("large-raster"));
+    let pyramid_dir = large_raster_dir.clone();
 
     let path_buf = std::path::PathBuf::from(&path);
     let ext = path_buf
@@ -629,7 +804,8 @@ pub async fn open_large_image(
         if ext == "bmp" {
             use crate::large_image::bmp::BmpInfo;
             let info = BmpInfo::from_file(&path_clone)?;
-            let (preview, pw, ph) = generate_bmp_preview(&path_clone, preview_max_size, cpu_threads)?;
+            let (preview, pw, ph) =
+                generate_bmp_preview(&path_clone, preview_max_size, cpu_threads)?;
             return Ok(PreparedImage {
                 width: info.width,
                 height: info.height,
@@ -732,6 +908,16 @@ pub async fn open_large_image(
     let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
     let mut guard = state_arc.lock().unwrap();
     let session_id = guard.next_session_id();
+    let max_level = compute_max_level(width, height, tile_size);
+    let levels = make_level_sources(
+        session_id,
+        width,
+        height,
+        max_level,
+        tile_source_path.clone(),
+        tile_source_is_temp,
+        pyramid_dir.as_deref(),
+    );
     let session = Arc::new(ImageSession {
         session_id,
         path: path_buf,
@@ -743,6 +929,9 @@ pub async fn open_large_image(
         raw_preview,
         tile_source_path,
         tile_source_is_temp,
+        max_level,
+        levels: Mutex::new(levels),
+        build_cancelled: Arc::new(AtomicBool::new(false)),
         preview_rgba,
         nav_preview_webp,
         pending_raster: Mutex::new(pending_img),
@@ -755,11 +944,23 @@ pub async fn open_large_image(
         preview_max_size,
         tileable,
         raw_preview,
+        max_level,
         preview_w,
         preview_h,
     };
     // 非 BMP 大图：后台尽快写栅格（即使用户不放大也释放整图内存；首个瓦片请求亦会触发 ensure_raster）。
-    let bg_session = if tile_source_is_temp {
+    let bg_level1_session = if tileable
+        && max_level >= 1
+        && !session.levels.lock().unwrap()[1]
+            .path
+            .as_os_str()
+            .is_empty()
+    {
+        Some(session.clone())
+    } else {
+        None
+    };
+    let bg_raster_session = if bg_level1_session.is_none() && tile_source_is_temp {
         Some(session.clone())
     } else {
         None
@@ -769,7 +970,11 @@ pub async fn open_large_image(
     for temp in evicted_temps {
         let _ = std::fs::remove_file(temp);
     }
-    if let Some(session) = bg_session {
+    if let Some(session) = bg_level1_session {
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = ensure_level(&session, 1);
+        });
+    } else if let Some(session) = bg_raster_session {
         tauri::async_runtime::spawn_blocking(move || {
             let _ = ensure_raster(&session);
         });
@@ -782,11 +987,11 @@ pub async fn open_large_image(
 #[tauri::command]
 pub async fn close_large_image(app: AppHandle, session_id: u64) -> Result<(), LargeImageError> {
     let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
-    let temp = {
+    let temps = {
         let mut guard = state_arc.lock().unwrap();
         guard.remove_session(session_id)
     };
-    if let Some(temp) = temp {
+    for temp in temps {
         let _ = std::fs::remove_file(temp);
     }
     Ok(())
@@ -795,7 +1000,10 @@ pub async fn close_large_image(app: AppHandle, session_id: u64) -> Result<(), La
 /// 获取预览原始 RGBA 字节（通过 IPC raw response，避免 fetch 自定义协议在 WKWebView 受限）。
 /// 前端按 OpenLargeImageResult.previewW/previewH 构造 ImageData。
 #[tauri::command]
-pub fn get_preview(app: AppHandle, session_id: u64) -> Result<tauri::ipc::Response, LargeImageError> {
+pub fn get_preview(
+    app: AppHandle,
+    session_id: u64,
+) -> Result<tauri::ipc::Response, LargeImageError> {
     let state_arc = app.state::<Arc<Mutex<LargeImageState>>>().inner().clone();
     let guard = state_arc.lock().unwrap();
     let session = guard
@@ -890,6 +1098,48 @@ mod tests {
         assert_eq!(scale_to_fit_correct(8192, 8192, 4096), (4096, 4096));
     }
 
+    #[test]
+    fn test_compute_max_level_uses_ceil_dimensions() {
+        assert_eq!(compute_max_level(19_200, 16_384, 512), 6);
+        assert_eq!(compute_max_level(1_000, 1_000, 512), 1);
+        assert_eq!(compute_max_level(513, 1, 512), 1);
+        assert_eq!(compute_max_level(512, 512, 512), 0);
+    }
+
+    #[test]
+    fn test_ensure_level_builds_and_publishes_level1() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let source = directory.path().join("source.bmp");
+        let rgba = vec![20u8, 40, 60, 255].repeat(4 * 4);
+        write_temp_bmp_raster(&rgba, 4, 4, 4, &source).unwrap();
+        let levels = make_level_sources(7, 4, 4, 1, source.clone(), false, Some(directory.path()));
+        let session = ImageSession {
+            session_id: 7,
+            path: source.clone(),
+            width: 4,
+            height: 4,
+            tile_size: 2,
+            preview_max_size: 4,
+            tileable: true,
+            raw_preview: false,
+            tile_source_path: source,
+            tile_source_is_temp: false,
+            max_level: 1,
+            levels: Mutex::new(levels),
+            build_cancelled: Arc::new(AtomicBool::new(false)),
+            pending_raster: Mutex::new(None),
+            preview_rgba: vec![],
+            nav_preview_webp: vec![],
+        };
+
+        ensure_level(&session, 1).unwrap();
+
+        let level = session.levels.lock().unwrap()[1].clone();
+        assert!(level.ready.load(Ordering::Acquire));
+        assert_eq!((level.width, level.height), (2, 2));
+        assert!(level.path.exists());
+    }
+
     // ── session lifecycle ──
 
     fn make_state() -> LargeImageState {
@@ -897,17 +1147,30 @@ mod tests {
     }
 
     fn make_session(id: u64) -> Arc<ImageSession> {
+        let tile_source_path = std::path::PathBuf::from("target/test.bmp");
+        let max_level = compute_max_level(1000, 1000, 512);
         Arc::new(ImageSession {
             session_id: id,
-            path: std::path::PathBuf::from("/tmp/test.bmp"),
+            path: tile_source_path.clone(),
             width: 1000,
             height: 1000,
             tile_size: 512,
             preview_max_size: 4096,
             tileable: true,
             raw_preview: false,
-            tile_source_path: std::path::PathBuf::from("/tmp/test.bmp"),
+            tile_source_path: tile_source_path.clone(),
             tile_source_is_temp: false,
+            max_level,
+            levels: Mutex::new(make_level_sources(
+                id,
+                1000,
+                1000,
+                max_level,
+                tile_source_path,
+                false,
+                None,
+            )),
+            build_cancelled: Arc::new(AtomicBool::new(false)),
             preview_rgba: vec![],
             nav_preview_webp: vec![],
             pending_raster: Mutex::new(None),
@@ -918,7 +1181,10 @@ mod tests {
     fn test_session_lookup() {
         let mut state = make_state();
         state.add_session(make_session(1));
-        assert!(state.find_session(1).is_some());
+        let session = state.find_session(1).unwrap();
+        assert!(session.levels.lock().unwrap()[0]
+            .ready
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -989,6 +1255,40 @@ mod tests {
         assert_eq!(error.code, "IO_ERROR");
     }
 
+    #[test]
+    fn test_level_not_ready_is_retryable() {
+        let state = Arc::new(Mutex::new(make_state()));
+        state.lock().unwrap().add_session(make_session(1));
+
+        let (status, error) = handle_tile_request(state, 1, 1, 0, 0).unwrap_err();
+        assert_eq!(status, 425);
+        assert_eq!(error.code, "LEVEL_NOT_READY");
+    }
+
+    #[test]
+    fn test_level_above_max_is_out_of_range() {
+        let state = Arc::new(Mutex::new(make_state()));
+        state.lock().unwrap().add_session(make_session(1));
+
+        let (status, error) = handle_tile_request(state, 1, 2, 0, 0).unwrap_err();
+        assert_eq!(status, 400);
+        assert_eq!(error.code, "TILE_OUT_OF_RANGE");
+    }
+
+    #[test]
+    fn test_per_level_tile_grid_is_validated() {
+        let state = Arc::new(Mutex::new(make_state()));
+        let session = make_session(1);
+        session.levels.lock().unwrap()[1]
+            .ready
+            .store(true, Ordering::Release);
+        state.lock().unwrap().add_session(session);
+
+        let (status, error) = handle_tile_request(state, 1, 1, 1, 0).unwrap_err();
+        assert_eq!(status, 400);
+        assert_eq!(error.code, "TILE_OUT_OF_RANGE");
+    }
+
     // ── tile cache ──
 
     #[test]
@@ -1044,7 +1344,16 @@ mod tests {
         assert_eq!(reader.info.width, w);
         assert_eq!(reader.info.height, h);
         let back = reader
-            .read_region(Rect { x: 0, y: 0, width: w, height: h }, w, h)
+            .read_region(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                },
+                w,
+                h,
+            )
             .unwrap();
         assert_eq!(back, rgba, "栅格往返 RGBA 必须一致");
     }
@@ -1067,10 +1376,23 @@ mod tests {
         let reader = BmpReader::open(f.path()).unwrap();
         assert_eq!((reader.info.width, reader.info.height), (w, h));
         let back = reader
-            .read_region(Rect { x: 0, y: 0, width: w, height: h }, w, h)
+            .read_region(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                },
+                w,
+                h,
+            )
             .unwrap();
         for i in 0..(w * h) as usize {
-            assert_eq!(&back[i * 4..i * 4 + 3], &rgb[i * 3..i * 3 + 3], "RGB 不一致 @{i}");
+            assert_eq!(
+                &back[i * 4..i * 4 + 3],
+                &rgb[i * 3..i * 3 + 3],
+                "RGB 不一致 @{i}"
+            );
             assert_eq!(back[i * 4 + 3], 255, "alpha 应为 255 @{i}");
         }
     }
