@@ -20,6 +20,7 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { useLargeImage } from '@/composables/useLargeImage'
 import { useFileOperations } from '@/composables/useFileOperations'
 import { eventToChord, resolveAction, type ActionId } from '@/utils/shortcuts'
+import type { ImageEntry } from '@/types/image'
 
 const appStore = useAppStore()
 const { t } = useI18n()
@@ -71,6 +72,25 @@ watch(directoryError, (error) => {
 /** path → HTMLImageElement，保持引用避免 GC 清除预加载资源。 */
 const preloadCache = new Map<string, HTMLImageElement>()
 
+/** RAW 扩展名（对应后端 extended_formats::RAW_EXTENSIONS）：走系统解码，<img> 无法直显。 */
+const RAW_PRELOAD_SKIP = new Set(['dng', 'cr2', 'cr3', 'nef', 'arw', 'raf', 'orf', 'rw2'])
+
+/**
+ * 判断邻居是否值得做全尺寸 <img> 预热。
+ *
+ * 仅 <img> 直显路径（jpg/png/小 tiff/heic 等）受益；大图/tile 路径（大 BMP、
+ * 超阈值文件、RAW）若也喂给 <img>，asset 协议会在 WebView 主线程整文件读取 +
+ * WebKit 解码，造成秒级卡顿。这些一律跳过，预热交给后端 prefetch_system_decode（子线程）。
+ */
+function shouldImgPreload(entry: ImageEntry, thresholdBytes: number): boolean {
+  const dot = entry.name.lastIndexOf('.')
+  const ext = dot >= 0 ? entry.name.slice(dot + 1).toLowerCase() : ''
+  if (ext === 'bmp') return false                 // 大 BMP 必走 tile；小 BMP 也无需 <img> 预热
+  if (RAW_PRELOAD_SKIP.has(ext)) return false      // RAW 走系统解码，<img> 解不了
+  if (entry.size >= thresholdBytes) return false   // 超大文件必走大图路径
+  return true
+}
+
 // ─── M3：切换到新图后预加载前后 N 张原图 ───────────────────────────────────
 
 watch(
@@ -82,12 +102,16 @@ watch(
     const entries = directoryStore.entries
     const idx = directoryStore.currentIndex
 
-    // 本次需要的路径集合
+    // 本次需要的邻居（去重，保留 entry 以便按格式/尺寸判定）
     const needed = new Set<string>()
+    const neededEntries: ImageEntry[] = []
     for (let i = 1; i <= count; i++) {
       for (const offset of [-i, i]) {
         const target = entries[idx + offset]
-        if (target) needed.add(target.path)
+        if (target && !needed.has(target.path)) {
+          needed.add(target.path)
+          neededEntries.push(target)
+        }
       }
     }
 
@@ -96,15 +120,17 @@ watch(
       if (!needed.has(path)) preloadCache.delete(path)
     }
 
-    // 对新增路径创建 Image 对象并缓存（避免重复创建）
-    for (const path of needed) {
-      if (!preloadCache.has(path)) {
+    // 仅对会走 <img> 直显的邻居创建全尺寸 Image 预热（避免在主线程解码大图）
+    const thresholdBytes = settings.value.largeImage.fileSizeThresholdMB * 1024 * 1024
+    for (const entry of neededEntries) {
+      if (!preloadCache.has(entry.path) && shouldImgPreload(entry, thresholdBytes)) {
         const img = new Image()
-        img.src = convertFileSrc(path)
-        preloadCache.set(path, img)
+        img.src = convertFileSrc(entry.path)
+        preloadCache.set(entry.path, img)
       }
     }
 
+    // 系统格式（TIFF/HEIC/RAW…）的预热交给后端子线程；非系统格式后端会自行跳过
     void invoke('prefetch_system_decode', { paths: [...needed] }).catch(() => {})
   },
 )
