@@ -16,21 +16,46 @@ use tauri::{Emitter, Manager};
 use thumbnails::{clear_thumbnail_cache, enforce_disk_cache_limit, get_thumbnail, ThumbnailState};
 
 #[derive(Default)]
-struct PendingOpenPaths(Mutex<Vec<String>>);
+struct PendingState {
+    paths: Vec<String>,
+    /// 前端是否已注册 open-paths 监听并就绪。
+    frontend_ready: bool,
+}
+
+#[derive(Default)]
+struct PendingOpenPaths(Mutex<PendingState>);
 
 impl PendingOpenPaths {
     fn new(paths: Vec<String>) -> Self {
-        Self(Mutex::new(paths))
+        Self(Mutex::new(PendingState {
+            paths,
+            frontend_ready: false,
+        }))
     }
 
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap())
+    /// 前端就绪：原子地置就绪并取走累积的待打开路径。
+    fn mark_ready_and_take(&self) -> Vec<String> {
+        let mut state = self.0.lock().unwrap();
+        state.frontend_ready = true;
+        std::mem::take(&mut state.paths)
+    }
+
+    /// 运行期/启动期打开请求:前端未就绪则入队并返回 false(调用方不要 emit,
+    /// 等前端就绪时由 mark_ready_and_take 取走);已就绪返回 true(走事件通道 emit)。
+    fn enqueue_or_ready(&self, paths: &[String]) -> bool {
+        let mut state = self.0.lock().unwrap();
+        if state.frontend_ready {
+            true
+        } else {
+            state.paths.extend_from_slice(paths);
+            false
+        }
     }
 }
 
 #[tauri::command]
 fn take_pending_open_paths(state: tauri::State<'_, PendingOpenPaths>) -> Vec<String> {
-    state.take()
+    state.mark_ready_and_take()
 }
 
 /// 从 picsee:// URL 中提取路径部分（不含 query string）。
@@ -237,8 +262,11 @@ pub fn run() {
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect();
                 if !paths.is_empty() {
-                    // 运行期 Apple Event 只走事件通道，避免与启动 argv 队列重复打开。
-                    let _ = app.emit("open-paths", paths);
+                    // 前端就绪 → 走事件通道；未就绪(冷启动 Apple Event 早于前端监听)→
+                    // 入队,待前端 take_pending_open_paths 时取走,避免首次双击丢失。
+                    if app.state::<PendingOpenPaths>().enqueue_or_ready(&paths) {
+                        let _ = app.emit("open-paths", paths);
+                    }
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
@@ -272,7 +300,26 @@ mod tests {
     fn pending_argv_paths_are_consumed_once() {
         let pending = PendingOpenPaths::new(vec!["/tmp/image.png".to_string()]);
 
-        assert_eq!(pending.take(), vec!["/tmp/image.png"]);
-        assert!(pending.take().is_empty());
+        assert_eq!(pending.mark_ready_and_take(), vec!["/tmp/image.png"]);
+        assert!(pending.mark_ready_and_take().is_empty());
+    }
+
+    #[test]
+    fn opened_paths_queue_until_frontend_ready() {
+        let pending = PendingOpenPaths::new(Vec::new());
+
+        // 前端未就绪：Apple Event 入队、不 emit。
+        assert!(!pending.enqueue_or_ready(&["/tmp/a.png".to_string()]));
+        assert!(!pending.enqueue_or_ready(&["/tmp/b.png".to_string()]));
+
+        // 前端就绪：取走累积的全部队列。
+        assert_eq!(
+            pending.mark_ready_and_take(),
+            vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()]
+        );
+
+        // 就绪后:走事件通道(返回 true),不再入队。
+        assert!(pending.enqueue_or_ready(&["/tmp/c.png".to_string()]));
+        assert!(pending.mark_ready_and_take().is_empty());
     }
 }
