@@ -309,24 +309,30 @@ pub fn generate_generic_preview(
 
 /// 通过 image-rs decoder 提取 ICC，并在解码后转换为 sRGB。
 fn decode_profiled_image(path: &Path) -> Result<image::DynamicImage, LargeImageError> {
-    let reader = image::ImageReader::open(path)
-        .map_err(|e| LargeImageError::decode(format!("打开图像失败: {e}")))?
-        .with_guessed_format()
-        .map_err(|e| LargeImageError::decode(format!("识别图像格式失败: {e}")))?;
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|e| LargeImageError::decode(format!("创建图像解码器失败: {e}")))?;
-    let icc = decoder.icc_profile().unwrap_or(None);
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img = image::DynamicImage::from_decoder(decoder)
-        .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
-    if let Some(icc) = icc {
-        img = color::dynamic_image_to_srgb(img, &icc);
+    let image_decode = (|| -> Result<image::DynamicImage, LargeImageError> {
+        let reader = image::ImageReader::open(path)
+            .map_err(|e| LargeImageError::decode(format!("打开图像失败: {e}")))?
+            .with_guessed_format()
+            .map_err(|e| LargeImageError::decode(format!("识别图像格式失败: {e}")))?;
+        let mut decoder = reader
+            .into_decoder()
+            .map_err(|e| LargeImageError::decode(format!("创建图像解码器失败: {e}")))?;
+        let icc = decoder.icc_profile().unwrap_or(None);
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut img = image::DynamicImage::from_decoder(decoder)
+            .map_err(|e| LargeImageError::decode(format!("解码图像失败: {e}")))?;
+        if let Some(icc) = icc {
+            img = color::dynamic_image_to_srgb(img, &icc);
+        }
+        img.apply_orientation(orientation);
+        Ok(img)
+    })();
+    match image_decode {
+        Ok(img) => Ok(img),
+        Err(image_error) => extended_formats::decode_system_image(path).map_err(|_| image_error),
     }
-    img.apply_orientation(orientation);
-    Ok(img)
 }
 
 // ─────────────────────────── 协议处理器 ───────────────────────────
@@ -805,6 +811,7 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use std::io::Write;
+    use std::process::Command;
     use tempfile::NamedTempFile;
 
     fn make_orientation_6_jpeg(width: u32, height: u32) -> Vec<u8> {
@@ -832,6 +839,30 @@ mod tests {
         let decoded = decode_profiled_image(file.path()).unwrap();
 
         assert_eq!((decoded.width(), decoded.height()), (4, 8));
+    }
+
+    #[test]
+    fn test_decode_profiled_image_falls_back_to_system_decoder() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let png = directory.path().join("input.png");
+        let tiff = directory.path().join("source.tiff");
+        let mislabeled = directory.path().join("source.png");
+        image::DynamicImage::new_rgb8(8, 6).save(&png).unwrap();
+        assert!(Command::new("sips")
+            .args(["-s", "format", "tiff"])
+            .arg(&png)
+            .args(["--out"])
+            .arg(&tiff)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::rename(tiff, &mislabeled).unwrap();
+
+        let decoded =
+            decode_profiled_image(&mislabeled).expect("image-rs 不支持 TIFF 时应回退系统解码");
+
+        assert_eq!((decoded.width(), decoded.height()), (8, 6));
     }
 
     // ── scale_to_fit_correct ──

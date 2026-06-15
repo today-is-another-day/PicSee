@@ -11,6 +11,45 @@ import type {
 
 /** 调用 token，每次 openImage 递增，用于取消旧的 in-flight 请求。 */
 let currentToken = 0
+/** 普通 <img> 加载失败后，每个路径只尝试一次后端解码回退。 */
+const normalDecodeFallbackPaths = new Set<string>()
+
+function localizeError(reason: unknown): Error {
+  const backend = reason as Partial<LargeImageBackendError> | null
+  if (backend && typeof backend.code === 'string') {
+    const key = `largeImage.errors.${backend.code}`
+    const translated = i18n.global.t(key)
+    return new Error(translated === key ? backend.message ?? String(reason) : translated)
+  }
+  return reason instanceof Error ? reason : new Error(String(reason))
+}
+
+/**
+ * 普通 <img> 解码失败时，改走后端通用解码路径。
+ *
+ * 返回 false 表示该路径已经尝试过回退，调用方应维持原错误处理。
+ */
+export async function fallbackNormalToDecoded(entry: ImageEntry): Promise<boolean> {
+  if (normalDecodeFallbackPaths.has(entry.path)) return false
+  normalDecodeFallbackPaths.add(entry.path)
+
+  const token = ++currentToken
+  const imageStore = useImageStore()
+  try {
+    const result = await invoke<OpenLargeImageResult>('open_large_image', { path: entry.path })
+    if (token !== currentToken) {
+      void invoke('close_large_image', { sessionId: result.sessionId }).catch(() => {})
+      return true
+    }
+
+    const session: LargeImageSession = { ...result, path: entry.path }
+    imageStore.setLargeImageSession('largeCandidate', session, result.width, result.height)
+  }
+  catch (err) {
+    if (token === currentToken) imageStore.markError(localizeError(err))
+  }
+  return true
+}
 
 /** TODO M4-debug：上报耗时事件到 vite dev server（DEV only）。 */
 function reportE2E(data: Record<string, unknown>): void {
@@ -48,16 +87,6 @@ export function useLargeImage() {
   function closeSession(session: LargeImageSession | null): void {
     if (!session) return
     void invoke('close_large_image', { sessionId: session.sessionId }).catch(() => {})
-  }
-
-  function localizeError(reason: unknown): Error {
-    const backend = reason as Partial<LargeImageBackendError> | null
-    if (backend && typeof backend.code === 'string') {
-      const key = `largeImage.errors.${backend.code}`
-      const translated = i18n.global.t(key)
-      return new Error(translated === key ? backend.message ?? String(reason) : translated)
-    }
-    return reason instanceof Error ? reason : new Error(String(reason))
   }
 
   /**

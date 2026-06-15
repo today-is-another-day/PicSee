@@ -523,23 +523,29 @@ fn decode_image_in(
         return Ok(img);
     }
 
-    let reader = ImageReader::new(Cursor::new(raw))
-        .with_guessed_format()
-        .map_err(|e| format!("Failed to guess image format ({}): {e}", path.display()))?;
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|e| format!("Failed to create image decoder ({}): {e}", path.display()))?;
-    let icc = decoder.icc_profile().unwrap_or(None);
-    let mut img = DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("Failed to decode image ({}): {e}", path.display()))?;
-    if let Some(icc) = icc {
-        img = color::dynamic_image_to_srgb(img, &icc);
-    }
+    let image_decode = (|| -> Result<DynamicImage, String> {
+        let reader = ImageReader::new(Cursor::new(raw))
+            .with_guessed_format()
+            .map_err(|e| format!("Failed to guess image format ({}): {e}", path.display()))?;
+        let mut decoder = reader
+            .into_decoder()
+            .map_err(|e| format!("Failed to create image decoder ({}): {e}", path.display()))?;
+        let icc = decoder.icc_profile().unwrap_or(None);
+        let mut img = DynamicImage::from_decoder(decoder)
+            .map_err(|e| format!("Failed to decode image ({}): {e}", path.display()))?;
+        if let Some(icc) = icc {
+            img = color::dynamic_image_to_srgb(img, &icc);
+        }
 
-    // Minor 3: apply EXIF orientation for any container kamadak-exif supports
-    // (JPEG, WebP, PNG with Exif chunk, TIFF, etc.); silently ignored when absent.
-    let oriented = apply_exif_orientation(img, raw);
-    Ok(oriented)
+        // Minor 3: apply EXIF orientation for any container kamadak-exif supports
+        // (JPEG, WebP, PNG with Exif chunk, TIFF, etc.); silently ignored when absent.
+        Ok(apply_exif_orientation(img, raw))
+    })();
+    match image_decode {
+        Ok(img) => Ok(img),
+        Err(image_error) => extended_formats::decode_system_image_in(path, system_decode_dir)
+            .map_err(|_| image_error),
+    }
 }
 
 /// Read EXIF Orientation and rotate/flip the image accordingly (EXIF orientation 1-8).
@@ -593,6 +599,7 @@ mod tests {
     use filetime::{set_file_mtime, FileTime};
     use image::GenericImageView;
     use std::io::Write;
+    use std::process::Command;
     use tempfile::NamedTempFile;
 
     /// Helper: create a minimal valid JPEG in memory using the image crate.
@@ -707,6 +714,31 @@ mod tests {
         let jpeg = make_jpeg_bytes(8, 6);
         let decoded = decode_image(&jpeg, "jpg", Path::new("/nonexistent/plain.jpg"))
             .expect("JPEG 应直接从内存由 image-rs 解码");
+        assert_eq!(decoded.dimensions(), (8, 6));
+    }
+
+    #[test]
+    fn test_decode_image_falls_back_to_system_decoder() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let png = directory.path().join("input.png");
+        let tiff = directory.path().join("source.tiff");
+        let mislabeled = directory.path().join("source.png");
+        image::DynamicImage::new_rgb8(8, 6).save(&png).unwrap();
+        assert!(Command::new("sips")
+            .args(["-s", "format", "tiff"])
+            .arg(&png)
+            .args(["--out"])
+            .arg(&tiff)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::rename(tiff, &mislabeled).unwrap();
+        let raw = std::fs::read(&mislabeled).unwrap();
+
+        let decoded = decode_image_in(&raw, "png", &mislabeled, Some(directory.path()))
+            .expect("image-rs 不支持 TIFF 时应回退系统解码");
+
         assert_eq!(decoded.dimensions(), (8, 6));
     }
 

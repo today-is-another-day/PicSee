@@ -107,6 +107,7 @@ pub fn probe_image_file(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    let mut system_decoded = extended_formats::is_system_decoded(path);
 
     let (width, height, format, tileable, raw_preview) = if ext == "svg" {
         // SVG 由 WebView 直接显示；自然尺寸在前端 img load 后确定。
@@ -114,27 +115,39 @@ pub fn probe_image_file(
     } else if ext == "bmp" {
         let info = super::bmp::BmpInfo::from_file(path)?;
         (info.width, info.height, "bmp".to_string(), true, false)
-    } else if extended_formats::is_system_decoded(path) {
+    } else if system_decoded {
         let (w, h) = extended_formats::probe_system_image(path)
             .map_err(LargeImageError::from_system_decode)?;
         (w, h, ext.clone(), false, extended_formats::is_raw(path))
     } else {
-        let reader = image::ImageReader::open(path)
-            .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
-            .with_guessed_format()
-            .map_err(|e| LargeImageError::io(format!("猜测格式失败: {e}")))?;
-        let fmt = reader
-            .format()
-            .map(|f| format!("{f:?}").to_lowercase())
-            .unwrap_or_else(|| ext.clone());
-        let (w, h) = reader
-            .into_dimensions()
-            .map_err(|e| LargeImageError::decode(format!("读取图像尺寸失败: {e}")))?;
-        (w, h, fmt, false, false)
+        let image_probe = (|| -> Result<_, LargeImageError> {
+            let reader = image::ImageReader::open(path)
+                .map_err(|e| LargeImageError::io(format!("打开图像失败: {e}")))?
+                .with_guessed_format()
+                .map_err(|e| LargeImageError::io(format!("猜测格式失败: {e}")))?;
+            let fmt = reader
+                .format()
+                .map(|f| format!("{f:?}").to_lowercase())
+                .unwrap_or_else(|| ext.clone());
+            let (w, h) = reader
+                .into_dimensions()
+                .map_err(|e| LargeImageError::decode(format!("读取图像尺寸失败: {e}")))?;
+            Ok((w, h, fmt, false, false))
+        })();
+        match image_probe {
+            Ok(probe) => probe,
+            Err(image_error) => match extended_formats::probe_system_image(path) {
+                Ok((w, h)) => {
+                    system_decoded = true;
+                    (w, h, ext.clone(), false, extended_formats::is_raw(path))
+                }
+                Err(_) => return Err(image_error),
+            },
+        }
     };
 
     let is_large = is_large_image(width, height, file_size, &ext, settings);
-    let load_mode = if extended_formats::is_system_decoded(path) {
+    let load_mode = if system_decoded {
         LoadMode::LargeCandidate
     } else {
         determine_load_mode(width, height, file_size, &ext, settings)
@@ -149,7 +162,7 @@ pub fn probe_image_file(
         load_mode,
         tileable,
         raw_preview,
-        can_fallback_to_normal: !extended_formats::is_system_decoded(path),
+        can_fallback_to_normal: !system_decoded,
     })
 }
 
@@ -216,6 +229,25 @@ mod tests {
             .unwrap()
             .status
             .success());
+        directory
+    }
+
+    fn make_mislabeled_tiff(extension: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let png = directory.path().join("source.png");
+        let tiff = directory.path().join("source.tiff");
+        let mislabeled = directory.path().join(format!("source.{extension}"));
+        image::DynamicImage::new_rgb8(8, 6).save(&png).unwrap();
+        assert!(Command::new("sips")
+            .args(["-s", "format", "tiff"])
+            .arg(&png)
+            .args(["--out"])
+            .arg(&tiff)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::rename(tiff, mislabeled).unwrap();
         directory
     }
 
@@ -391,5 +423,19 @@ mod tests {
         assert_eq!(probe.load_mode, LoadMode::Normal);
         assert_eq!(probe.format, "svg");
         assert!(probe.can_fallback_to_normal);
+    }
+
+    #[test]
+    fn test_probe_mislabeled_tiff_falls_back_to_system_decoder() {
+        let directory = make_mislabeled_tiff("png");
+        let probe = probe_image_file(&directory.path().join("source.png"), &default_settings())
+            .expect("image-rs 不支持 TIFF 时应回退系统探测");
+
+        assert_eq!((probe.width, probe.height), (8, 6));
+        assert_eq!(probe.format, "png");
+        assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+        assert!(!probe.tileable);
+        assert!(!probe.raw_preview);
+        assert!(!probe.can_fallback_to_normal);
     }
 }

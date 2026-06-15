@@ -4,14 +4,17 @@ import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 
 import { useImageStore } from '@/stores/image'
+import { useDirectoryStore } from '@/stores/directory'
 import { useSettingsStore } from '@/stores/settings'
 import { useViewerStore } from '@/stores/viewer'
 import LargeImageCanvas from '@/components/LargeImageCanvas.vue'
 import NavigatorOverlay from '@/components/NavigatorOverlay.vue'
 import { useFileOperations } from '@/composables/useFileOperations'
+import { fallbackNormalToDecoded } from '@/composables/useLargeImage'
 
 const { t } = useI18n()
 const imageStore = useImageStore()
+const directoryStore = useDirectoryStore()
 const settingsStore = useSettingsStore()
 const viewerStore = useViewerStore()
 const fileOperations = useFileOperations()
@@ -85,7 +88,9 @@ function handleLoad(event: Event) {
   viewerStore.applyDisplayMode(viewerStore.displayMode)
 }
 
-function handleError() {
+async function handleError() {
+  const entry = directoryStore.currentEntry
+  if (imageStore.loadMode === 'normal' && entry && await fallbackNormalToDecoded(entry)) return
   imageStore.markError(new Error('image-load-failed'))
 }
 
