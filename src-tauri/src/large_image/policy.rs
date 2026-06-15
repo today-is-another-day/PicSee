@@ -109,12 +109,22 @@ pub fn probe_image_file(
         .to_lowercase();
     let mut system_decoded = extended_formats::is_system_decoded(path);
 
+    // HEIC/HEIF/TIFF 等 WebKit(WKWebView)原生可解码的系统格式(排除 RAW、排除超大文件):
+    // 走与 JPG 相同的 <img> 直通路径 —— 原生秒开、随机跳转也快、由 WebKit 正确色彩管理。
+    // <img> 万一无法解码,前端 onerror 会回退到 sips/canvas(decode_system_image),不丢图。
+    let file_size_threshold = settings.file_size_threshold_mb.saturating_mul(1024 * 1024);
+    let render_via_webview =
+        system_decoded && !extended_formats::is_raw(path) && file_size < file_size_threshold;
+
     let (width, height, format, tileable, raw_preview) = if ext == "svg" {
         // SVG 由 WebView 直接显示；自然尺寸在前端 img load 后确定。
         (0, 0, "svg".to_string(), false, false)
     } else if ext == "bmp" {
         let info = super::bmp::BmpInfo::from_file(path)?;
         (info.width, info.height, "bmp".to_string(), true, false)
+    } else if render_via_webview {
+        // 同 SVG:不 spawn sips,尺寸交给前端 <img> onload 确定。
+        (0, 0, ext.clone(), false, false)
     } else if system_decoded {
         let (w, h) = extended_formats::probe_system_dimensions(path)
             .map_err(LargeImageError::from_system_decode)?;
@@ -147,7 +157,9 @@ pub fn probe_image_file(
     };
 
     let is_large = is_large_image(width, height, file_size, &ext, settings);
-    let load_mode = if system_decoded {
+    let load_mode = if render_via_webview {
+        LoadMode::Normal
+    } else if system_decoded {
         LoadMode::LargeCandidate
     } else {
         determine_load_mode(width, height, file_size, &ext, settings)
@@ -162,7 +174,7 @@ pub fn probe_image_file(
         load_mode,
         tileable,
         raw_preview,
-        can_fallback_to_normal: !system_decoded,
+        can_fallback_to_normal: render_via_webview || !system_decoded,
     })
 }
 
@@ -394,12 +406,29 @@ mod tests {
 
     #[test]
     fn test_probe_tiff_is_preview_only() {
+        // TIFF 可被 WebKit 原生渲染：小文件走 <img> 直通(Normal),与 JPG 同速,
+        // 不再 spawn sips;尺寸交给前端 onload 确定。
         let directory = make_system_decoded_file("tiff");
         let probe = probe_image_file(&directory.path().join("source.tiff"), &default_settings())
-            .expect("TIFF 应由系统解码器探测");
-        assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+            .expect("TIFF 应可探测");
+        assert_eq!(probe.load_mode, LoadMode::Normal);
         assert!(!probe.tileable);
         assert!(!probe.raw_preview);
+        assert!(probe.can_fallback_to_normal);
+    }
+
+    #[test]
+    fn test_probe_oversized_tiff_uses_system_decoder() {
+        // 超过文件大小阈值的 WebKit 可渲染格式仍走 sips/canvas(避免 <img> 全量解码超大图)。
+        let directory = make_system_decoded_file("tiff");
+        let settings = LargeImageSettings {
+            file_size_threshold_mb: 0,
+            ..LargeImageSettings::default()
+        };
+        let probe = probe_image_file(&directory.path().join("source.tiff"), &settings)
+            .expect("TIFF 应可探测");
+        assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+        assert!(!probe.can_fallback_to_normal);
     }
 
     #[test]
