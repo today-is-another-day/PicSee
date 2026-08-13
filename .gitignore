@@ -154,3 +154,7 @@ src-tauri/gen/schemas
 
 # 测试用大图文件（不提交到版本库）
 test-assets/
+
+# JetBrains IDE 本地配置
+.idea/
+.run/
