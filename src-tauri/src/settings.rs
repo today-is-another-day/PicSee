@@ -284,10 +284,12 @@ impl Default for CacheSettings {
 impl Default for PerformanceSettings {
     fn default() -> Self {
         Self {
-            tile_concurrency: 4,
+            // 瓦片解码/编码是纯 CPU 且互相独立，并发上去首屏填充明显更快；
+            // 8 在 8 核以上机器留有余量，低核机器由 tokio 阻塞线程池自然排队。
+            tile_concurrency: 8,
             decode_concurrency: 2,
-            thumbnail_concurrency: 4,
-            cpu_threads: 8,
+            thumbnail_concurrency: 6,
+            cpu_threads: 12,
             preload_normal_count: 2,
             preload_large_preview_count: 1,
         }

@@ -4,6 +4,7 @@ pub mod file_operations;
 pub mod images;
 pub mod large_image;
 pub mod settings;
+pub mod system_decode_backend;
 pub mod thumbnails;
 
 use extended_formats::prefetch_system_decode;

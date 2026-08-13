@@ -38,7 +38,7 @@
     ],
     "fileAssociations": [
       {
-        "ext": ["jpg", "jpeg", "png", "webp", "gif", "bmp", "svg", "tiff", "tif", "heic", "heif", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef"],
+        "ext": ["jpg", "jpeg", "png", "webp", "avif", "jxl", "gif", "bmp", "svg", "tiff", "tif", "heic", "heif", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef"],
         "name": "Image",
         "role": "Viewer",
         "rank": "Default"

@@ -73,8 +73,12 @@ watch(directoryError, (error) => {
 /** path → HTMLImageElement，保持引用避免 GC 清除预加载资源。 */
 const preloadCache = new Map<string, HTMLImageElement>()
 
-/** RAW 扩展名（对应后端 extended_formats::RAW_EXTENSIONS）：走系统解码，<img> 无法直显。 */
-const RAW_PRELOAD_SKIP = new Set(['dng', 'cr2', 'cr3', 'nef', 'arw', 'raf', 'orf', 'rw2'])
+/**
+ * `<img>` 无法直显、必须走系统解码的扩展名。
+ * RAW 对应后端 `extended_formats::RAW_EXTENSIONS`；
+ * JXL 因 WebKit 支持在各版本间反复，后端也不走 `<img>` 直显路径（`is_jxl`）。
+ */
+const RAW_PRELOAD_SKIP = new Set(['dng', 'cr2', 'cr3', 'nef', 'arw', 'raf', 'orf', 'rw2', 'jxl'])
 
 /**
  * 判断邻居是否值得做全尺寸 <img> 预热。

@@ -18,9 +18,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::settings::read_settings_file;
 
 /// Supported thumbnail format extensions (lowercase).
-const THUMBNAIL_EXTENSIONS: [&str; 18] = [
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "tif", "heic", "heif", "dng", "cr2", "cr3",
-    "nef", "arw", "raf", "orf", "rw2",
+const THUMBNAIL_EXTENSIONS: [&str; 20] = [
+    "jpg", "jpeg", "png", "webp", "avif", "jxl", "gif", "bmp", "tiff", "tif", "heic", "heif", "dng",
+    "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
 ];
 
 /// 超过此单边像素或 MAX_INPROC_PIXELS 时改用 sips 子进程降采样（内存隔离），不在本进程整图解码。
@@ -441,15 +441,9 @@ pub fn generate_thumbnail(
         .map(|directory| directory.join("system-decode"));
 
     // 1. 仅读 header 取尺寸（系统格式 sips 元数据；普通格式 image-rs header）。
+    //    这里不施加解码上限：超限的图在第 2 步统一走子进程降采样。
     let (w, h) = if extended_formats::is_system_decoded(path) {
-        extended_formats::probe_system_image(path).map_err(|error| {
-            if error.starts_with("IMAGE_TOO_LARGE:") {
-                // 系统格式（TIFF/HEIC/RAW）超限暂仍跳过；常规大图为非系统格式，走下方 sips 降采样。
-                GenError::ImageTooLarge
-            } else {
-                GenError::DecodeFailed(error)
-            }
-        })?
+        extended_formats::probe_system_source_dimensions(path).map_err(GenError::DecodeFailed)?
     } else {
         let reader = ImageReader::open(path)
             .map_err(|e| GenError::IoFailed(format!("Failed to open image file: {e}")))?
@@ -466,7 +460,7 @@ pub fn generate_thumbnail(
     let oversized =
         w > MAX_SIDE_PIXELS || h > MAX_SIDE_PIXELS || (w as u64 * h as u64) > MAX_INPROC_PIXELS;
     let img = if oversized {
-        extended_formats::downscale_with_sips_in(path, size, system_decode_dir.as_deref())
+        extended_formats::downscale_in(path, size, system_decode_dir.as_deref())
             .map_err(GenError::DecodeFailed)?
     } else {
         // 系统/ColorSync 链路直接读路径（避免对 HEIC/RAW 再整文件读入内存）。

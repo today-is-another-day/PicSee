@@ -8,9 +8,9 @@ use std::{
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
-const IMAGE_EXTENSIONS: [&str; 20] = [
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "svg", "tiff", "tif", "heic", "heif", "dng", "cr2",
-    "cr3", "nef", "arw", "raf", "orf", "rw2", "pef",
+const IMAGE_EXTENSIONS: [&str; 22] = [
+    "jpg", "jpeg", "png", "webp", "avif", "jxl", "gif", "bmp", "svg", "tiff", "tif", "heic", "heif",
+    "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef",
 ];
 
 /// 图片文件信息。

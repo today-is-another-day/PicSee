@@ -113,8 +113,24 @@ pub fn probe_image_file(
     // 走与 JPG 相同的 <img> 直通路径 —— 原生秒开、随机跳转也快、由 WebKit 正确色彩管理。
     // <img> 万一无法解码,前端 onerror 会回退到 sips/canvas(decode_system_image),不丢图。
     let file_size_threshold = settings.file_size_threshold_mb.saturating_mul(1024 * 1024);
-    let render_via_webview =
-        system_decoded && !extended_formats::is_raw(path) && file_size < file_size_threshold;
+    let mut render_via_webview = system_decoded
+        && !extended_formats::is_raw(path)
+        && !extended_formats::is_jxl(path)
+        && file_size < file_size_threshold;
+
+    // 但文件大小不能代表系统格式的解码代价：AVIF/HEIC 压缩比极高，
+    // 105MB 的 AVIF 可含 1.5 亿像素，喂给 <img> 会让 WebView 主线程解码卡顿秒级、
+    // 并在 WebKit 内驻留数百 MB。因此再按像素数判一次（header 探测，不解码）。
+    let mut probed_dimensions = None;
+    if render_via_webview {
+        if let Ok((w, h)) = extended_formats::probe_system_source_dimensions(path) {
+            probed_dimensions = Some((w, h));
+            if w as u64 * h as u64 >= settings.pixel_threshold {
+                render_via_webview = false;
+            }
+        }
+    }
+    let render_via_webview = render_via_webview;
 
     let (width, height, format, tileable, raw_preview) = if ext == "svg" {
         // SVG 由 WebView 直接显示；自然尺寸在前端 img load 后确定。
@@ -126,8 +142,11 @@ pub fn probe_image_file(
         // 同 SVG:不 spawn sips,尺寸交给前端 <img> onload 确定。
         (0, 0, ext.clone(), false, false)
     } else if system_decoded {
-        let (w, h) = extended_formats::probe_system_dimensions(path)
-            .map_err(LargeImageError::from_system_decode)?;
+        let (w, h) = match probed_dimensions {
+            Some(dimensions) => dimensions,
+            None => extended_formats::probe_system_dimensions(path)
+                .map_err(LargeImageError::from_system_decode)?,
+        };
         (w, h, ext.clone(), false, extended_formats::is_raw(path))
     } else {
         let image_probe = (|| -> Result<_, LargeImageError> {
@@ -146,7 +165,7 @@ pub fn probe_image_file(
         })();
         match image_probe {
             Ok(probe) => probe,
-            Err(image_error) => match extended_formats::probe_system_image(path) {
+            Err(image_error) => match extended_formats::probe_system_source_dimensions(path) {
                 Ok((w, h)) => {
                     system_decoded = true;
                     (w, h, ext.clone(), false, extended_formats::is_raw(path))
@@ -428,6 +447,22 @@ mod tests {
         let probe = probe_image_file(&directory.path().join("source.tiff"), &settings)
             .expect("TIFF 应可探测");
         assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+        assert!(!probe.can_fallback_to_normal);
+    }
+
+    #[test]
+    fn test_probe_high_pixel_system_format_skips_webview_path() {
+        // 文件小但像素多的系统格式（AVIF/HEIC 压缩比极高）不能交给 <img>：
+        // WebView 主线程整图解码会卡秒级。此处用极低的像素阈值模拟该场景。
+        let directory = make_system_decoded_file("tiff");
+        let settings = LargeImageSettings {
+            pixel_threshold: 1,
+            ..LargeImageSettings::default()
+        };
+        let probe = probe_image_file(&directory.path().join("source.tiff"), &settings)
+            .expect("TIFF 应可探测");
+        assert_eq!(probe.load_mode, LoadMode::LargeCandidate);
+        assert_eq!((probe.width, probe.height), (8, 6), "应已探测出真实尺寸");
         assert!(!probe.can_fallback_to_normal);
     }
 

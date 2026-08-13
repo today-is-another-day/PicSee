@@ -263,7 +263,11 @@ function render() {
     canvas.height = Math.round(cssH * dpr)
   }
 
-  const ctx = canvas.getContext('2d')
+  const ctx = canvas.getContext('2d', {
+    // desynchronized: 允许绕过合成器同步，缩放/拖动时的绘制延迟更低；
+    // alpha 保留（tile 可能含透明像素）。
+    desynchronized: true,
+  })
   if (!ctx) return
 
   ctx.clearRect(0, 0, canvas.width, canvas.height)

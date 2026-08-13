@@ -45,6 +45,11 @@ const NAV_PREVIEW_CAP: u32 = 384;
 /// 100M 像素 ≈ 解码峰值数百 MB，权衡内存预算与可视化收益。
 const MAX_RASTER_PIXELS: u64 = 100_000_000;
 
+/// 系统格式（AVIF/TIFF/HEIC/RAW）临时 BMP 栅格的单会话磁盘上限。
+/// 栅格由外部解码器直接写盘、按需分块读取，不占本进程内存，故上限按磁盘而非内存设定；
+/// 超出时等比降采样（2GB ≈ 7.1 亿像素，14386×10481 的 AVIF 约 431MB，无需降采样）。
+const SYSTEM_RASTER_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// 同层构建 claim 的等待间隔与上界，总等待约 2 秒。
 const LEVEL_CLAIM_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 const LEVEL_CLAIM_WAIT_MAX_POLLS: u32 = 400;
@@ -440,6 +445,68 @@ pub fn generate_bmp_tile(
     };
     let rgba = reader.read_region(rect, w, h)?;
     encode_rgba_to_webp(&rgba, w, h, 85.0)
+}
+
+/// 系统格式（AVIF/TIFF/HEIC/RAW）的临时 BMP 栅格最长边：按磁盘预算等比收敛。
+///
+/// 24-bit BMP ≈ w×h×3 字节；返回 `None` 表示原尺寸即在预算内，无需降采样。
+fn raster_max_side(width: u32, height: u32) -> Option<u32> {
+    let bytes = width as u64 * height as u64 * 3;
+    if bytes <= SYSTEM_RASTER_MAX_BYTES {
+        return None;
+    }
+    let ratio = (SYSTEM_RASTER_MAX_BYTES as f64 / bytes as f64).sqrt();
+    let longest = width.max(height) as f64 * ratio;
+    Some((longest as u32).max(1))
+}
+
+/// 系统格式 → 临时 BMP 栅格 + 预览，使其接入与 BMP 相同的分块/金字塔管线。
+///
+/// 关键收益：整图像素只经外部解码器进程落盘，本进程按需分块读取，
+/// 打开耗时与常驻内存都与源图像素数解耦。
+/// 返回 `Ok(None)` 表示当前平台后端不支持 BMP 直转，调用方应回退到预览路径。
+fn prepare_system_bmp_raster(
+    path: &Path,
+    raster_dir: &Path,
+    preview_max_size: u32,
+    cpu_threads: u32,
+) -> Result<Option<PreparedImage>, LargeImageError> {
+    use crate::large_image::bmp::BmpInfo;
+
+    let (source_width, source_height) = extended_formats::probe_system_source_dimensions(path)
+        .map_err(LargeImageError::from_system_decode)?;
+    let max_side = raster_max_side(source_width, source_height);
+
+    let seq = RASTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let raster = raster_dir.join(format!("raster-{seq}.bmp"));
+    let written = extended_formats::decode_system_image_to_bmp(path, max_side, &raster)
+        .map_err(LargeImageError::from_system_decode)?;
+    if !written {
+        return Ok(None);
+    }
+
+    // 栅格已落盘：此后任何失败都必须删除它，避免临时文件泄漏。
+    let prepared = (|| -> Result<PreparedImage, LargeImageError> {
+        let info = BmpInfo::from_file(&raster)?;
+        let (preview, preview_w, preview_h) =
+            generate_bmp_preview(&raster, preview_max_size, cpu_threads)?;
+        Ok(PreparedImage {
+            width: info.width,
+            height: info.height,
+            preview_rgba: preview,
+            preview_w,
+            preview_h,
+            tileable: true,
+            raw_preview: extended_formats::is_raw(path),
+            tile_source_path: raster.clone(),
+            tile_source_is_temp: true,
+            pending_img: None,
+        })
+    })();
+    if prepared.is_err() {
+        let _ = std::fs::remove_file(&raster);
+    }
+    prepared.map(Some)
 }
 
 /// 生成通用格式（非 BMP）预览图（原始 RGBA 字节 + 尺寸）。
@@ -1071,6 +1138,21 @@ pub async fn open_large_image(
         }
 
         if extended_formats::is_system_decoded(&path_clone) {
+            // 首选：让外部解码器（sips/ImageIO）直接把源图写成未压缩 BMP 栅格，
+            // 本进程零整图驻留，随后完全复用 BMP 大图管线（分块 + 金字塔 + 预取）。
+            // 实测 1.5 亿像素 AVIF：BMP 栅格约 1.0s，而旧的 PNG 中转 + 整图入内存约 10s / 350MB+。
+            if let Some(dir) = large_raster_dir.as_deref() {
+                match prepare_system_bmp_raster(&path_clone, dir, preview_max_size, cpu_threads) {
+                    Ok(Some(prepared)) => return Ok(prepared),
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "[PicSee] 系统格式 BMP 栅格失败，回退预览路径: {}",
+                        error.message
+                    ),
+                }
+            }
+
+            // 回退：整图系统解码 → 仅预览（Linux 无 BMP 直转、或栅格失败时）。
             let decoded =
                 extended_formats::decode_system_image_in(&path_clone, system_decode_dir.as_deref())
                     .map_err(LargeImageError::from_system_decode)?;
@@ -2271,6 +2353,106 @@ mod tests {
         let tile = generate_bmp_tile(f.path(), 0, 0, 512, width, height).unwrap();
         assert!(!tile.is_empty());
         println!("Tile (0,0) 大小: {}KB", tile.len() / 1024);
+    }
+
+    #[test]
+    fn raster_max_side_only_downscales_beyond_disk_budget() {
+        // 14386×10481（≈431MB 24-bit BMP）在预算内，不降采样。
+        assert_eq!(raster_max_side(14_386, 10_481), None);
+        // 40000×30000 ≈ 3.4GB，需降到预算内；结果按长边等比收敛。
+        let side = raster_max_side(40_000, 30_000).expect("超预算应降采样");
+        assert!(side < 40_000);
+        let scaled_height = (30_000u64 * side as u64) / 40_000;
+        assert!(side as u64 * scaled_height * 3 <= SYSTEM_RASTER_MAX_BYTES);
+    }
+
+    /// AVIF 等系统格式应接入 BMP 分块管线（tileable），而不是退化为只读预览。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_format_prepares_tileable_bmp_raster() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_png = directory.path().join("source.png");
+        image::DynamicImage::new_rgb8(320, 200)
+            .save(&source_png)
+            .unwrap();
+        let avif = directory.path().join("source.avif");
+        assert!(Command::new("sips")
+            .args(["-s", "format", "avif"])
+            .arg(&source_png)
+            .arg("--out")
+            .arg(&avif)
+            .output()
+            .unwrap()
+            .status
+            .success());
+
+        let raster_dir = directory.path().join("large-raster");
+        let prepared = prepare_system_bmp_raster(&avif, &raster_dir, 512, 4)
+            .unwrap()
+            .expect("macOS 应支持 BMP 栅格直转");
+
+        assert!(prepared.tileable, "系统格式应可分块，否则放大只有模糊预览");
+        assert!(prepared.tile_source_is_temp);
+        assert_eq!((prepared.width, prepared.height), (320, 200));
+        assert!(prepared.pending_img.is_none(), "整图不应驻留本进程内存");
+        assert!(prepared.tile_source_path.exists());
+        assert_eq!(
+            prepared.preview_rgba.len(),
+            prepared.preview_w as usize * prepared.preview_h as usize * 4
+        );
+        // 栅格可被瓦片读取器消费。
+        let tile = generate_bmp_tile(
+            &prepared.tile_source_path,
+            0,
+            0,
+            256,
+            prepared.width,
+            prepared.height,
+        )
+        .unwrap();
+        assert_eq!(&tile[0..4], b"RIFF");
+    }
+
+    /// 大图打开链路基准：`PICSEE_BENCH_IMAGE=<path> cargo test benchmark_system_open -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn benchmark_system_open_path() {
+        let Ok(source) = std::env::var("PICSEE_BENCH_IMAGE") else {
+            eprintln!("未设置 PICSEE_BENCH_IMAGE，跳过");
+            return;
+        };
+        let source = std::path::PathBuf::from(source);
+        let directory = tempfile::tempdir().unwrap();
+
+        let start = std::time::Instant::now();
+        let prepared = prepare_system_bmp_raster(&source, directory.path(), 2048, 8)
+            .unwrap()
+            .expect("macOS 应支持 BMP 栅格直转");
+        let open_ms = start.elapsed().as_millis();
+        let raster_bytes = std::fs::metadata(&prepared.tile_source_path).unwrap().len();
+
+        let tile_start = std::time::Instant::now();
+        let tile = generate_bmp_tile(
+            &prepared.tile_source_path,
+            0,
+            0,
+            512,
+            prepared.width,
+            prepared.height,
+        )
+        .unwrap();
+        let tile_ms = tile_start.elapsed().as_millis();
+
+        println!(
+            "system open {}×{}: 栅格+预览={}ms, 栅格={}MB, 首个 tile={}KB/{}ms",
+            prepared.width,
+            prepared.height,
+            open_ms,
+            raster_bytes / 1024 / 1024,
+            tile.len() / 1024,
+            tile_ms
+        );
     }
 
     #[test]

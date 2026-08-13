@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    覆盖 Tauri 由 tauri.conf.json 的 fileAssociations 自动生成的 CFBundleDocumentTypes。
+    自动生成的版本把 heic/heif 错误映射为不存在的 UTI "public.heif-standard-image"，
+    并且漏掉了全部 RAW 格式，导致系统「打开方式」中 PicSee 对这些格式变灰不可选。
+    这里改用真实 UTI（标准图片），RAW 则仅按扩展名匹配（各厂商 UTI 跨系统版本不一致）。
+  -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Image</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.jpeg</string>
+        <string>public.png</string>
+        <string>public.tiff</string>
+        <string>com.compuserve.gif</string>
+        <string>com.microsoft.bmp</string>
+        <string>public.svg-image</string>
+        <string>org.webmproject.webp</string>
+        <string>public.heic</string>
+        <string>public.heif</string>
+        <string>public.avif</string>
+        <string>public.jpeg-xl</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>RAW Image</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Default</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>dng</string>
+        <string>cr2</string>
+        <string>cr3</string>
+        <string>nef</string>
+        <string>arw</string>
+        <string>raf</string>
+        <string>orf</string>
+        <string>rw2</string>
+        <string>pef</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

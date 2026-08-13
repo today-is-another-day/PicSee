@@ -18,11 +18,13 @@ fn supported_image_filter_is_case_insensitive_and_rejects_other_files() {
         "photo.gif",
         "photo.bmp",
         "photo.svg",
+        "photo.avif",
+        "photo.AVIF",
     ] {
         assert!(is_supported_image(Path::new(name)), "{name} 应被识别为图片");
     }
 
-    for name in ["photo.txt", "photo.avif", "photo", ".jpg"] {
+    for name in ["photo.txt", "photo.flif", "photo", ".jpg"] {
         assert!(
             !is_supported_image(Path::new(name)),
             "{name} 不应被识别为图片"
