@@ -94,15 +94,32 @@ async function handleError() {
   imageStore.markError(new Error('image-load-failed'))
 }
 
+/** 把 line/page 单位的滚动量换算成 CSS 像素。 */
+function wheelDelta(value: number, mode: number, pageSize: number) {
+  if (mode === 1) return value * 16
+  if (mode === 2) return value * pageSize
+  return value
+}
+
 function handleWheel(event: WheelEvent) {
-  if (!imageStore.hasImage || event.deltaY === 0) return
+  if (!imageStore.hasImage) return
+  const deltaX = wheelDelta(event.deltaX, event.deltaMode, viewerStore.viewport.width)
+  const deltaY = wheelDelta(event.deltaY, event.deltaMode, viewerStore.viewport.height)
+  // 触摸板捏合手势在 WebKit 中以 ctrlKey + wheel 的形式派发，Cmd/Ctrl + 滚轮同理 → 缩放
+  if (event.ctrlKey || event.metaKey) {
+    if (deltaY === 0) return
+    event.preventDefault()
+    const rect = viewer.value?.getBoundingClientRect()
+    const point = settingsStore.settings.viewer.zoomToCursor && rect
+      ? { x: event.clientX - rect.left, y: event.clientY - rect.top }
+      : undefined
+    viewerStore.setZoom(viewerStore.zoom * Math.exp(-deltaY * 0.02), point)
+    return
+  }
+  // 双指横/纵向滚动 → 视角跟随移动（内容随手指方向走）
+  if ((deltaX === 0 && deltaY === 0) || !viewerStore.canPan) return
   event.preventDefault()
-  const rect = viewer.value?.getBoundingClientRect()
-  const point = settingsStore.settings.viewer.zoomToCursor && rect
-    ? { x: event.clientX - rect.left, y: event.clientY - rect.top }
-    : undefined
-  const sensitivity = event.ctrlKey ? 0.02 : 0.002
-  viewerStore.setZoom(viewerStore.zoom * Math.exp(-event.deltaY * sensitivity), point)
+  viewerStore.moveBy(-deltaX, -deltaY)
 }
 
 function handlePointerDown(event: PointerEvent) {
